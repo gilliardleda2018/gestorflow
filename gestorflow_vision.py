@@ -54,10 +54,9 @@ from gestorflow_auditoria import (
     DocumentRecord,
     audit_document,
     validate_chain,
-    validate_declaracao_limites,
 )
 
-# Tipos que validate_chain()/validate_declaracao_limites() esperam
+# Tipos que validate_chain() espera
 # encontrar no dict `documents` chaveado por DocumentType (um único
 # registro por tipo, por design de gestorflow_auditoria.py). Qualquer
 # outro tipo pode aparecer mais de uma vez no mesmo lote (ex.: os 6
@@ -601,6 +600,24 @@ def run_vision_pipeline(
                     conformity=result,
                 )
                 if doc_type in _TIPOS_DA_CADEIA:
+                    anterior = documents.get(doc_type)
+                    if anterior is not None:
+                        # A cadeia cronologica exige exatamente 1 documento
+                        # por tipo (validate_chain nao suporta duplicata),
+                        # entao mantem so o mais recente - mas registra a
+                        # colisao em vez de descartar o anterior em
+                        # silencio. Colisao real costuma ser confusao de
+                        # classificacao entre tipos parecidos (ex.: o
+                        # proprio PDF de especificacao alerta que
+                        # Resolucao do PAS e Resolucao do Pleito podem se
+                        # confundir) ou paginas do mesmo documento
+                        # classificadas separadamente.
+                        rows.append((
+                            anterior.label, "SOBRESCRITO",
+                            f"tambem classificado como {doc_type.value} - substituido por '{label_base}' "
+                            "(a cadeia cronologica aceita so 1 documento por tipo; confira se nao houve "
+                            "confusao de classificacao ou se as paginas pertencem ao mesmo documento)",
+                        ))
                     documents[doc_type] = record
                 else:
                     avulsos.append(record)
@@ -610,11 +627,10 @@ def run_vision_pipeline(
 
     validate_chain(documents)
 
-    if DocumentType.DECLARACAO_LIMITES in documents and context.get("data_referencia_auditoria"):
-        validate_declaracao_limites(
-            documents[DocumentType.DECLARACAO_LIMITES],
-            context["data_referencia_auditoria"],
-        )
+    # Nao chama validate_declaracao_limites aqui: a mesma regra dos 30 dias
+    # ja roda dentro de audit_document() via _check_declaracao_limites
+    # (AUDIT_SPECS[DECLARACAO_LIMITES].check_fn) - chamar as duas duplicava
+    # a mesma pendencia duas vezes na mesma linha do relatorio.
 
     for record in list(documents.values()) + avulsos:
         conforme = record.conformity.conforme if record.conformity else False

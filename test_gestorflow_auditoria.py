@@ -18,6 +18,7 @@ from gestorflow_auditoria import (
     DocumentRecord,
     DocumentType,
     audit_document,
+    run_pipeline,
     validate_chain,
     validate_declaracao_limites,
 )
@@ -306,6 +307,38 @@ class TestAuditContextFromJson(unittest.TestCase):
             self.assertTrue(any("municipio_esperado" in str(w.message) for w in registrados))
         finally:
             os.remove(caminho)
+
+
+class TestRunPipelineDeclaracaoLimitesSemDuplicidade(unittest.TestCase):
+    def test_pendencia_de_30_dias_aparece_uma_vez_so(self):
+        # Regressao: run_pipeline chamava tanto _check_declaracao_limites
+        # (via check_fn de audit_document) quanto validate_declaracao_limites
+        # separadamente - a mesma pendencia de "mais de 30 dias" aparecia
+        # duas vezes na mesma linha do relatorio.
+        texto = (
+            "DECLARACAO\n"
+            "O Prefeito Municipal declara, nos termos do art. 11, paragrafo "
+            "unico, e do art. 25, LC 101/00, que o municipio cumpre os "
+            "limites constitucionais."
+        )
+        data_emissao = date(2026, 1, 1)
+
+        def extract_fields(_texto, _tipo):
+            return dict(
+                municipio="Exemplo/MA", prefeito="Fulano",
+                art_11_lc101="cumprido", art_25_lc101="cumprido",
+                data_emissao=data_emissao, assinatura="Fulano",
+            )
+
+        contexto = {"data_referencia_auditoria": date(2026, 6, 15)}
+        linhas = run_pipeline(
+            [{"texto": texto, "label": "Declaracao de Limites", "data": data_emissao}],
+            extract_fields, contexto,
+        )
+        self.assertEqual(len(linhas), 1)
+        _label, status, pendencias = linhas[0]
+        self.assertEqual(status, "NAO CONFORME")
+        self.assertEqual(pendencias.count("mais de 30 dias"), 1)
 
 
 if __name__ == "__main__":

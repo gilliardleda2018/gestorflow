@@ -879,11 +879,10 @@ def run_pipeline(
 
     validate_chain(documents)
 
-    if DocumentType.DECLARACAO_LIMITES in documents and context.get("data_referencia_auditoria"):
-        validate_declaracao_limites(
-            documents[DocumentType.DECLARACAO_LIMITES],
-            context["data_referencia_auditoria"],
-        )
+    # Nao chama validate_declaracao_limites aqui: a mesma regra dos 30 dias
+    # ja roda dentro de audit_document() via _check_declaracao_limites
+    # (AUDIT_SPECS[DECLARACAO_LIMITES].check_fn) - chamar as duas duplicava
+    # a mesma pendencia duas vezes na mesma linha do relatorio.
 
     for record in documents.values():
         conforme = record.conformity.conforme if record.conformity else False

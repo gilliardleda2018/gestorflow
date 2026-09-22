@@ -102,10 +102,15 @@ class TestRunVisionPipelineNaoSobrescreveMesmoTipo(unittest.TestCase):
         self.assertTrue(any(l.startswith("siops_bim1.pdf") for l in labels))
         self.assertTrue(any(l.startswith("siops_bim2.pdf") for l in labels))
 
-    def test_documento_da_cadeia_continua_unico_por_tipo(self):
+    def test_documento_da_cadeia_continua_unico_por_tipo_mas_colisao_fica_visivel(self):
         # RESOLUCAO_PLEITO participa da cadeia cronologica - o design de
-        # validate_chain espera um unico registro por tipo, entao aqui o
-        # comportamento de "1 por tipo" continua sendo o correto.
+        # validate_chain espera um unico registro por tipo, entao o
+        # segundo documento classificado com o mesmo tipo ainda substitui
+        # o primeiro no dict interno. Mas isso e um sinal de possivel
+        # confusao de classificacao (o proprio PDF de especificacao avisa
+        # que Resolucao do PAS e Resolucao do Pleito podem se confundir) -
+        # regressao real, achada rodando contra documentos reais: o
+        # primeiro nao pode mais sumir do relatorio em silencio.
         reader = MagicMock()
         reader.classify.side_effect = [
             MagicMock(document_type=DocumentType.RESOLUCAO_PLEITO, confidence=0.9),
@@ -119,7 +124,10 @@ class TestRunVisionPipelineNaoSobrescreveMesmoTipo(unittest.TestCase):
                 reader=reader,
                 min_confidence=0.5,
             )
-        self.assertEqual(len(rows), 1)
+        self.assertEqual(len(rows), 2)
+        status_por_arquivo = {r[0].split(" (")[0]: r[1] for r in rows}
+        self.assertEqual(status_por_arquivo["resolucao_v1.pdf"], "SOBRESCRITO")
+        self.assertNotEqual(status_por_arquivo["resolucao_v2.pdf"], "SOBRESCRITO")
 
 
 class TestParseDateField(unittest.TestCase):
