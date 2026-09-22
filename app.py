@@ -7,16 +7,22 @@ verificação de assinatura (digital + manuscrita) sem usar o terminal:
 upload de documentos, escolha do provedor de visão, execução e tabela
 de conformidade na tela, com download do relatório em markdown.
 
-Protegido por senha simples (variável de ambiente APP_PASSWORD) - sem
-ela definida, a app roda sem gate (útil só para desenvolvimento local).
+Protegido por senha simples (segredo APP_PASSWORD) - sem ela definida,
+a app roda sem gate (útil só para desenvolvimento local).
 
 Rodar localmente:
     streamlit run app.py
 
-Variáveis de ambiente:
+Segredos necessários (nome igual, venham de onde vierem):
     APP_PASSWORD           - senha de acesso à interface (recomendado em produção)
     GEMINI_API_KEY          - provedor Gemini (tier gratuito)
     ANTHROPIC_API_KEY       - provedor Claude (pago)
+
+Funciona tanto no Render (variável de ambiente de verdade) quanto no
+Streamlit Community Cloud (segredo em `st.secrets`, formato TOML) -
+`_sync_secrets_to_env()` copia o que estiver em `st.secrets` para
+`os.environ` na subida, já que o resto do projeto (make_reader() etc.)
+sempre lê variável de ambiente, para funcionar igual nos dois lugares.
 """
 
 from __future__ import annotations
@@ -33,6 +39,19 @@ from gestorflow_signature import check_signature, format_check_result
 from gestorflow_vision import make_reader, run_vision_pipeline
 
 st.set_page_config(page_title="GestorFlow", page_icon="📋", layout="wide")
+
+
+def _sync_secrets_to_env() -> None:
+    # st.secrets.get(...) lanca StreamlitSecretNotFoundError (nao KeyError)
+    # quando nao existe NENHUM secrets.toml - por isso o try cobre o loop
+    # inteiro, nao so o acesso inicial a st.secrets.
+    try:
+        for chave in ("APP_PASSWORD", "GEMINI_API_KEY", "GOOGLE_API_KEY", "ANTHROPIC_API_KEY"):
+            valor = st.secrets.get(chave)
+            if valor and not os.environ.get(chave):
+                os.environ[chave] = valor
+    except Exception:
+        pass  # sem secrets.toml (uso local via variavel de ambiente) - tudo bem
 
 
 def _check_password() -> bool:
@@ -88,6 +107,8 @@ def _contexto_padrao() -> dict:
 
 
 def main() -> None:
+    _sync_secrets_to_env()
+
     if not _check_password():
         return
 
