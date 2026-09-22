@@ -21,6 +21,7 @@ from unittest.mock import MagicMock, patch
 from gestorflow_auditoria import DocumentType
 from gestorflow_vision import (
     AnthropicVisionDocumentReader,
+    BaseVisionDocumentReader,
     GeminiVisionDocumentReader,
     _coerce_dates,
     _parse_date_field,
@@ -216,6 +217,88 @@ class TestGeminiVisionDocumentReader(unittest.TestCase):
 
             self.assertEqual(campos["data_emissao"], date(2026, 3, 1))
             self.assertEqual(campos["valor_solicitado"], 1000.0)
+
+
+class _FakeReader(BaseVisionDocumentReader):
+    """Reader de teste: `_call_vision` sob controle direto do teste, sem
+    tocar em nenhum provedor real - so pra exercitar o retry da base."""
+
+    def __init__(self, respostas):
+        self._respostas = list(respostas)
+        self.chamadas = 0
+
+    def _call_vision(self, image_bytes, prompt):
+        self.chamadas += 1
+        resposta = self._respostas.pop(0)
+        if isinstance(resposta, Exception):
+            raise resposta
+        return resposta
+
+
+class TestCallVisionRetrying(unittest.TestCase):
+    def test_tenta_de_novo_em_erro_transitorio_e_devolve_no_sucesso(self):
+        reader = _FakeReader([
+            Exception("503 UNAVAILABLE: sobrecarregado"),
+            Exception("429 RESOURCE_EXHAUSTED"),
+            '{"tipo": null, "confianca": 0.0, "indicios_encontrados": []}',
+        ])
+        with patch("time.sleep"):
+            resultado = reader._call_vision_retrying(b"img", "prompt")
+        self.assertEqual(reader.chamadas, 3)
+        self.assertIn('"tipo": null', resultado)
+
+    def test_desiste_apos_todas_as_tentativas_falharem(self):
+        reader = _FakeReader([Exception("503 UNAVAILABLE")] * 10)
+        with patch("time.sleep"), self.assertRaises(Exception):
+            reader._call_vision_retrying(b"img", "prompt", retries=2)
+        self.assertEqual(reader.chamadas, 3)  # tentativa inicial + 2 retries
+
+    def test_erro_nao_transitorio_nao_tenta_de_novo(self):
+        reader = _FakeReader([ValueError("JSON invalido"), "nunca deveria chegar aqui"])
+        with self.assertRaises(ValueError):
+            reader._call_vision_retrying(b"img", "prompt")
+        self.assertEqual(reader.chamadas, 1)
+
+
+class TestRunVisionPipelineResilienteAFalha(unittest.TestCase):
+    def test_uma_pagina_com_erro_nao_derruba_as_demais(self):
+        reader = MagicMock()
+        reader.classify.side_effect = [
+            RuntimeError("503 UNAVAILABLE"),
+            MagicMock(document_type=DocumentType.OFICIO_SOLICITACAO_RECURSOS, confidence=0.9),
+        ]
+        reader.extract_fields.return_value = {}
+        with patch("gestorflow_vision.load_as_images", side_effect=[[b"p1"], [b"p2"]]):
+            rows = run_vision_pipeline(
+                ["falha.pdf", "ok.pdf"],
+                context={},
+                reader=reader,
+                min_confidence=0.5,
+            )
+        status_por_arquivo = {r[0].split(" (")[0]: r[1] for r in rows}
+        self.assertEqual(status_por_arquivo["falha.pdf"], "ERRO")
+        self.assertIn("ok.pdf", status_por_arquivo)
+        self.assertNotEqual(status_por_arquivo["ok.pdf"], "ERRO")
+
+    def test_arquivo_ilegivel_nao_derruba_os_demais(self):
+        reader = MagicMock()
+        reader.classify.return_value = MagicMock(
+            document_type=DocumentType.OFICIO_SOLICITACAO_RECURSOS, confidence=0.9
+        )
+        reader.extract_fields.return_value = {}
+        with patch(
+            "gestorflow_vision.load_as_images",
+            side_effect=[FileNotFoundError("corrompido"), [b"p1"]],
+        ):
+            rows = run_vision_pipeline(
+                ["corrompido.pdf", "ok.pdf"],
+                context={},
+                reader=reader,
+                min_confidence=0.5,
+            )
+        status_por_arquivo = {r[0].split(" (")[0]: r[1] for r in rows}
+        self.assertEqual(status_por_arquivo["corrompido.pdf"], "ERRO")
+        self.assertNotEqual(status_por_arquivo["ok.pdf"], "ERRO")
 
 
 if __name__ == "__main__":

@@ -41,6 +41,7 @@ import io
 import json
 import os
 import re
+import time
 from dataclasses import dataclass
 from datetime import date
 from typing import Any, Optional
@@ -323,17 +324,43 @@ class ManualSignatureAssessment:
         return self.presente and self.tipo == "manuscrita" and self.aparenta_autentica is not False
 
 
+_MARCADORES_ERRO_TRANSITORIO = (
+    "503", "429", "UNAVAILABLE", "RESOURCE_EXHAUSTED", "rate limit", "overloaded", "Overloaded",
+)
+
+
 class BaseVisionDocumentReader:
     """
     Interface comum a qualquer provedor de visão (Anthropic, Gemini, ou
     outro que venha a ser plugado). Subclasses só precisam implementar
     `_call_vision(image_bytes, prompt) -> str`; toda a lógica de prompts,
-    parsing de JSON e coerção de datas mora aqui - uma única vez,
+    parsing de JSON, coerção de datas e retry mora aqui - uma única vez,
     independente do provedor por trás.
     """
 
     def _call_vision(self, image_bytes: bytes, prompt: str) -> str:
         raise NotImplementedError
+
+    def _call_vision_retrying(
+        self, image_bytes: bytes, prompt: str, retries: int = 3, base_delay: float = 5.0,
+    ) -> str:
+        """
+        Chama `_call_vision` com retry/backoff exponencial para erros
+        TRANSITÓRIOS (sobrecarga do provedor - "503"/"429"/"UNAVAILABLE"/
+        "RESOURCE_EXHAUSTED" etc.), comuns no tier gratuito do Gemini sob
+        demanda. Qualquer outro erro (chave inválida, resposta que não é
+        JSON válido etc.) é relançado imediatamente, sem esperar - não é
+        o tipo de falha que uma segunda tentativa resolveria.
+        """
+        for tentativa in range(retries + 1):
+            try:
+                return self._call_vision(image_bytes, prompt)
+            except Exception as exc:
+                transitorio = any(marcador in str(exc) for marcador in _MARCADORES_ERRO_TRANSITORIO)
+                if not transitorio or tentativa == retries:
+                    raise
+                time.sleep(base_delay * (2 ** tentativa))
+        raise AssertionError("inalcancavel")  # loop sempre retorna ou relanca
 
     @staticmethod
     def _parse_json(raw: str) -> dict[str, Any]:
@@ -341,7 +368,7 @@ class BaseVisionDocumentReader:
         return json.loads(cleaned)
 
     def classify(self, image_bytes: bytes) -> VisionClassification:
-        raw = self._call_vision(image_bytes, build_classification_prompt())
+        raw = self._call_vision_retrying(image_bytes, build_classification_prompt())
         data = self._parse_json(raw)
         doc_type = _safe_document_type(data.get("tipo"))
         return VisionClassification(
@@ -351,7 +378,7 @@ class BaseVisionDocumentReader:
         )
 
     def extract_fields(self, image_bytes: bytes, doc_type: DocumentType) -> dict[str, Any]:
-        raw = self._call_vision(image_bytes, build_extraction_prompt(doc_type))
+        raw = self._call_vision_retrying(image_bytes, build_extraction_prompt(doc_type))
         return _coerce_dates(self._parse_json(raw))
 
     def assess_manual_signature(self, image_bytes: bytes) -> ManualSignatureAssessment:
@@ -360,7 +387,7 @@ class BaseVisionDocumentReader:
         de papel) - ver `gestorflow_signature.check_signature`, que
         decide automaticamente entre este método e a verificação
         criptográfica conforme o tipo de arquivo."""
-        raw = self._call_vision(image_bytes, build_manual_signature_prompt())
+        raw = self._call_vision_retrying(image_bytes, build_manual_signature_prompt())
         data = self._parse_json(raw)
         return ManualSignatureAssessment(
             presente=bool(data.get("assinatura_presente", False)),
@@ -372,7 +399,7 @@ class BaseVisionDocumentReader:
 
     def classify_and_extract(self, image_bytes: bytes) -> tuple[VisionClassification, dict[str, Any]]:
         """Chamada única: classifica e extrai os campos no mesmo turno."""
-        raw = self._call_vision(image_bytes, build_combined_prompt())
+        raw = self._call_vision_retrying(image_bytes, build_combined_prompt())
         data = self._parse_json(raw)
         doc_type = _safe_document_type(data.get("tipo"))
         classification = VisionClassification(
@@ -536,36 +563,50 @@ def run_vision_pipeline(
     rows: list[tuple[str, str, str]] = []
 
     for path in file_paths:
-        for page_num, image_bytes in enumerate(load_as_images(path), start=1):
+        try:
+            paginas = load_as_images(path)
+        except Exception as exc:
+            rows.append((os.path.basename(path), "ERRO", f"falha ao carregar arquivo: {exc}"))
+            continue
+
+        for page_num, image_bytes in enumerate(paginas, start=1):
             label_base = os.path.basename(path) + (f" (pág. {page_num})" if path.lower().endswith(".pdf") else "")
 
-            if mode == "single_call":
-                classification, fields_ = reader.classify_and_extract(image_bytes)
-            else:
-                classification = reader.classify(image_bytes)
-                fields_ = {}
+            # Uma pagina com erro (falha persistente de API, resposta
+            # nao-JSON, tipo classificado invalido etc.) nao pode derrubar
+            # o lote inteiro e perder o que ja foi processado - registra
+            # a falha nessa linha e segue para a proxima pagina/arquivo.
+            try:
+                if mode == "single_call":
+                    classification, fields_ = reader.classify_and_extract(image_bytes)
+                else:
+                    classification = reader.classify(image_bytes)
+                    fields_ = {}
 
-            if classification.document_type is None or classification.confidence < min_confidence:
-                rows.append((label_base, "NAO CLASSIFICADO",
-                             f"confianca={classification.confidence:.2f}"))
+                if classification.document_type is None or classification.confidence < min_confidence:
+                    rows.append((label_base, "NAO CLASSIFICADO",
+                                 f"confianca={classification.confidence:.2f}"))
+                    continue
+
+                doc_type = classification.document_type
+                if mode == "two_call":
+                    fields_ = reader.extract_fields(image_bytes, doc_type)
+                result = audit_document(doc_type, label_base, fields_, context)
+
+                record = DocumentRecord(
+                    document_type=doc_type,
+                    label=result.document_label,
+                    data_documento=_parse_date_field(fields_),
+                    is_digital=True,
+                    conformity=result,
+                )
+                if doc_type in _TIPOS_DA_CADEIA:
+                    documents[doc_type] = record
+                else:
+                    avulsos.append(record)
+            except Exception as exc:
+                rows.append((label_base, "ERRO", str(exc)))
                 continue
-
-            doc_type = classification.document_type
-            if mode == "two_call":
-                fields_ = reader.extract_fields(image_bytes, doc_type)
-            result = audit_document(doc_type, label_base, fields_, context)
-
-            record = DocumentRecord(
-                document_type=doc_type,
-                label=result.document_label,
-                data_documento=_parse_date_field(fields_),
-                is_digital=True,
-                conformity=result,
-            )
-            if doc_type in _TIPOS_DA_CADEIA:
-                documents[doc_type] = record
-            else:
-                avulsos.append(record)
 
     validate_chain(documents)
 
