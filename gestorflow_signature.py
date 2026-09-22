@@ -44,7 +44,7 @@ from pyhanko.sign.validation.status import SignatureCoverageLevel
 from pyhanko.keys import load_certs_from_pemder
 from pyhanko_certvalidator import ValidationContext
 
-from gestorflow_vision import ManualSignatureAssessment, VisionDocumentReader, load_as_images
+from gestorflow_vision import BaseVisionDocumentReader, ManualSignatureAssessment, load_as_images
 
 
 @dataclass
@@ -218,7 +218,7 @@ class SignatureCheckResult:
 
 def check_signature(
     file_path: str,
-    reader: Optional[VisionDocumentReader] = None,
+    reader: Optional[BaseVisionDocumentReader] = None,
     trust_roots_path: Optional[str] = None,
 ) -> SignatureCheckResult:
     """
@@ -232,8 +232,9 @@ def check_signature(
          assinatura digital embutida - ex.: scan de papel salvo como
          PDF), usa o modelo de visão para avaliar se há uma assinatura
          a caneta plausível na página. Método = "manual". Requer
-         `reader` (VisionDocumentReader) - sem ele, retorna
-         metodo="sem_assinatura" com erro explicando a limitação.
+         `reader` (qualquer BaseVisionDocumentReader - Anthropic ou
+         Gemini) - sem ele, retorna metodo="sem_assinatura" com erro
+         explicando a limitação.
 
     Isso cobre tanto o processo 100% digital (documento gerado e
     assinado eletronicamente) quanto o processo com papel assinado à
@@ -255,7 +256,7 @@ def check_signature(
     if reader is None:
         return SignatureCheckResult(
             path=file_path, metodo="sem_assinatura", legitima=None,
-            erro="nenhuma assinatura digital embutida encontrada e nenhum VisionDocumentReader "
+            erro="nenhuma assinatura digital embutida encontrada e nenhum reader de visao "
                  "foi informado para avaliar assinatura manuscrita",
         )
 

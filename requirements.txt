@@ -2,8 +2,11 @@
 
 # Extensão com visão computacional (gestorflow_vision.py):
 pymupdf>=1.24
-anthropic>=0.40
 pillow>=10.0
+
+# Provedores de visão - instale pelo menos um:
+anthropic>=0.40      # Claude - pago, sem tier gratuito persistente
+google-genai>=1.0    # Gemini - tem tier gratuito (aistudio.google.com)
 
 # Verificação de assinatura digital em PDF - ICP-Brasil (gestorflow_signature.py):
 pyHanko>=0.25

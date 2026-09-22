@@ -3,18 +3,21 @@ GestorFlow - CLI de ponta a ponta
 ==================================
 
 Roda o pipeline de classificação e auditoria sobre um conjunto de
-arquivos (PDF ou imagem) usando o modelo de visão da Anthropic, com o
-contexto de auditoria (cadastro da proposta, ficha do CNES, atos de
-nomeação etc.) carregado de um JSON.
+arquivos (PDF ou imagem) usando um modelo de visão, com o contexto de
+auditoria (cadastro da proposta, ficha do CNES, atos de nomeação etc.)
+carregado de um JSON.
 
 Uso:
     python gestorflow_cli.py --context examples/context_exemplo.json \
         --files doc1.pdf doc2.jpg doc3.png \
-        [--mode two_call|single_call] [--min-confidence 0.5] \
-        [--output resultado.md] [--model claude-sonnet-4-6] \
+        [--provider anthropic|gemini] [--mode two_call|single_call] \
+        [--min-confidence 0.5] [--output resultado.md] [--model NOME] \
         [--verify-signatures] [--trust-roots icp_brasil_raizes.pem]
 
-Requer ANTHROPIC_API_KEY no ambiente (ou --api-key).
+Sem --provider, detecta automaticamente pela API key disponível no
+ambiente: ANTHROPIC_API_KEY -> Claude (pago); senão
+GEMINI_API_KEY/GOOGLE_API_KEY -> Gemini (tem tier gratuito - crie uma
+chave em https://aistudio.google.com).
 
 --verify-signatures reconhece os dois modelos de assinatura: PDFs com
 assinatura digital embutida (PAdES/CAdES) são validados
@@ -33,7 +36,7 @@ import sys
 
 from gestorflow_auditoria import AuditContext
 from gestorflow_signature import check_signature, format_check_result
-from gestorflow_vision import VisionDocumentReader, run_vision_pipeline
+from gestorflow_vision import BaseVisionDocumentReader, make_reader, run_vision_pipeline
 
 
 def format_table(rows: list[tuple[str, str, str]]) -> str:
@@ -43,7 +46,7 @@ def format_table(rows: list[tuple[str, str, str]]) -> str:
     return "\n".join(linhas)
 
 
-def format_signature_section(files: list[str], reader: VisionDocumentReader, trust_roots_path: str | None) -> str:
+def format_signature_section(files: list[str], reader: BaseVisionDocumentReader, trust_roots_path: str | None) -> str:
     linhas = ["", "## Verificacao de assinatura", ""]
     for path in files:
         resultado = check_signature(path, reader=reader, trust_roots_path=trust_roots_path)
@@ -62,8 +65,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                          help="two_call (padrao, mais preciso) ou single_call (mais barato)")
     parser.add_argument("--min-confidence", type=float, default=0.5)
     parser.add_argument("--output", help="Se informado, grava a tabela em markdown neste caminho")
-    parser.add_argument("--model", default="claude-sonnet-4-6")
-    parser.add_argument("--api-key", default=None, help="Sobrescreve ANTHROPIC_API_KEY")
+    parser.add_argument("--provider", choices=["anthropic", "gemini"], default=None,
+                         help="Provedor de visao. Sem isso, detecta pela API key disponivel no ambiente")
+    parser.add_argument("--model", default=None, help="Sobrescreve o modelo padrao do provedor escolhido")
+    parser.add_argument("--api-key", default=None,
+                         help="Sobrescreve a API key do provedor (ANTHROPIC_API_KEY ou GEMINI_API_KEY/GOOGLE_API_KEY)")
     parser.add_argument("--verify-signatures", action="store_true",
                          help="Verifica assinatura digital (PDF nativo) ou manuscrita (visao) de cada arquivo")
     parser.add_argument("--trust-roots", default=None,
@@ -74,10 +80,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-
-    if not args.api_key and not os.environ.get("ANTHROPIC_API_KEY"):
-        print("Erro: defina ANTHROPIC_API_KEY no ambiente ou use --api-key", file=sys.stderr)
-        return 1
 
     faltando = [f for f in args.files if not os.path.exists(f)]
     if faltando:
@@ -95,8 +97,8 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     try:
-        reader = VisionDocumentReader(api_key=args.api_key, model=args.model)
-    except RuntimeError as exc:
+        reader = make_reader(provider=args.provider, api_key=args.api_key, model=args.model)
+    except (RuntimeError, ValueError) as exc:
         print(f"Erro: {exc}", file=sys.stderr)
         return 1
 

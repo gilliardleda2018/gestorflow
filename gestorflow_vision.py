@@ -21,10 +21,17 @@ Por que visão em vez de OCR tradicional (Tesseract, etc.)?
     originais é exatamente o que um modelo multimodal faz bem.
 
 Dependências (instalar no ambiente onde este script for executado):
-    pip install pymupdf anthropic pillow
+    pip install pymupdf pillow
+    pip install anthropic      # provedor Claude (pago)
+    pip install google-genai   # provedor Gemini (tem tier gratuito)
 
-Requer uma ANTHROPIC_API_KEY configurada no ambiente para as chamadas
-reais ao modelo.
+Dois provedores de visão são suportados por trás da mesma interface
+(`BaseVisionDocumentReader`): `AnthropicVisionDocumentReader` (Claude,
+requer ANTHROPIC_API_KEY) e `GeminiVisionDocumentReader` (Gemini,
+requer GEMINI_API_KEY ou GOOGLE_API_KEY - crie uma gratuitamente em
+https://aistudio.google.com). Use `make_reader()` para escolher
+automaticamente pelo que estiver configurado no ambiente, ou informe
+`provider="anthropic"|"gemini"` explicitamente.
 """
 
 from __future__ import annotations
@@ -73,6 +80,13 @@ try:
     import anthropic
 except ImportError:
     anthropic = None
+
+try:
+    from google import genai
+    from google.genai import types as genai_types
+except ImportError:
+    genai = None
+    genai_types = None
 
 
 # ---------------------------------------------------------------------------
@@ -309,39 +323,17 @@ class ManualSignatureAssessment:
         return self.presente and self.tipo == "manuscrita" and self.aparenta_autentica is not False
 
 
-class VisionDocumentReader:
+class BaseVisionDocumentReader:
     """
-    Encapsula as chamadas ao modelo com visão. Usa a API da Anthropic
-    (Claude) por padrão; troque `_call_vision` para usar outro provedor
-    multimodal se preferir.
+    Interface comum a qualquer provedor de visão (Anthropic, Gemini, ou
+    outro que venha a ser plugado). Subclasses só precisam implementar
+    `_call_vision(image_bytes, prompt) -> str`; toda a lógica de prompts,
+    parsing de JSON e coerção de datas mora aqui - uma única vez,
+    independente do provedor por trás.
     """
-
-    def __init__(self, api_key: Optional[str] = None, model: str = "claude-sonnet-4-6"):
-        if anthropic is None:
-            raise RuntimeError("Instale o SDK: pip install anthropic")
-        self.client = anthropic.Anthropic(api_key=api_key or os.environ.get("ANTHROPIC_API_KEY"))
-        self.model = model
 
     def _call_vision(self, image_bytes: bytes, prompt: str) -> str:
-        response = self.client.messages.create(
-            model=self.model,
-            max_tokens=1500,
-            messages=[{
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": _media_type_for(image_bytes),
-                            "data": _b64(image_bytes),
-                        },
-                    },
-                    {"type": "text", "text": prompt},
-                ],
-            }],
-        )
-        return "".join(block.text for block in response.content if block.type == "text")
+        raise NotImplementedError
 
     @staticmethod
     def _parse_json(raw: str) -> dict[str, Any]:
@@ -391,6 +383,123 @@ class VisionDocumentReader:
         return classification, _coerce_dates(data.get("campos", {}))
 
 
+class AnthropicVisionDocumentReader(BaseVisionDocumentReader):
+    """Provedor Claude (Anthropic). Requer ANTHROPIC_API_KEY - sem tier
+    gratuito persistente."""
+
+    def __init__(self, api_key: Optional[str] = None, model: str = "claude-sonnet-4-6"):
+        if anthropic is None:
+            raise RuntimeError("Instale o SDK: pip install anthropic")
+        resolved_key = api_key or os.environ.get("ANTHROPIC_API_KEY")
+        if not resolved_key:
+            raise RuntimeError("Defina ANTHROPIC_API_KEY no ambiente ou passe api_key explicitamente")
+        self.client = anthropic.Anthropic(api_key=resolved_key)
+        self.model = model
+
+    def _call_vision(self, image_bytes: bytes, prompt: str) -> str:
+        response = self.client.messages.create(
+            model=self.model,
+            max_tokens=1500,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": _media_type_for(image_bytes),
+                            "data": _b64(image_bytes),
+                        },
+                    },
+                    {"type": "text", "text": prompt},
+                ],
+            }],
+        )
+        return "".join(block.text for block in response.content if block.type == "text")
+
+
+class GeminiVisionDocumentReader(BaseVisionDocumentReader):
+    """
+    Provedor Google Gemini - tem tier gratuito (com limite de taxa),
+    útil para testar o pipeline sem custo antes de decidir se migra
+    para um provedor pago. Requer GEMINI_API_KEY ou GOOGLE_API_KEY
+    (crie gratuitamente em https://aistudio.google.com).
+
+    Confirme o nome do modelo atual em aistudio.google.com/models - o
+    catálogo de modelos gratuitos muda com o tempo; passe `model=` para
+    sobrescrever o padrão se o nome abaixo não existir mais.
+    """
+
+    def __init__(self, api_key: Optional[str] = None, model: str = "gemini-2.5-flash"):
+        if genai is None:
+            raise RuntimeError("Instale o SDK: pip install google-genai")
+        resolved_key = api_key or os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+        if not resolved_key:
+            raise RuntimeError(
+                "Defina GEMINI_API_KEY (ou GOOGLE_API_KEY) no ambiente ou passe api_key explicitamente "
+                "- crie uma chave gratuita em https://aistudio.google.com"
+            )
+        self.client = genai.Client(api_key=resolved_key)
+        self.model = model
+
+    def _call_vision(self, image_bytes: bytes, prompt: str) -> str:
+        response = self.client.models.generate_content(
+            model=self.model,
+            contents=[
+                genai_types.Part.from_bytes(data=image_bytes, mime_type=_media_type_for(image_bytes)),
+                prompt,
+            ],
+        )
+        return response.text or ""
+
+
+# Alias mantido por compatibilidade - "VisionDocumentReader" continua
+# significando o provedor Anthropic (comportamento padrão histórico
+# deste módulo). Código/testes existentes que importam esse nome
+# continuam funcionando sem alteração.
+VisionDocumentReader = AnthropicVisionDocumentReader
+
+
+_PROVIDERS: dict[str, type[BaseVisionDocumentReader]] = {
+    "anthropic": AnthropicVisionDocumentReader,
+    "gemini": GeminiVisionDocumentReader,
+}
+
+
+def make_reader(
+    provider: Optional[str] = None,
+    api_key: Optional[str] = None,
+    model: Optional[str] = None,
+) -> BaseVisionDocumentReader:
+    """
+    Cria o reader do provedor certo. Sem `provider` explícito, detecta
+    automaticamente pela variável de ambiente disponível: ANTHROPIC_API_KEY
+    -> Anthropic; senão GEMINI_API_KEY/GOOGLE_API_KEY -> Gemini. Sem
+    nenhuma das duas, lança RuntimeError explicando o que falta.
+    """
+    if provider is None:
+        if api_key or os.environ.get("ANTHROPIC_API_KEY"):
+            provider = "anthropic"
+        elif os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY"):
+            provider = "gemini"
+        else:
+            raise RuntimeError(
+                "Nenhuma API key encontrada no ambiente. Defina ANTHROPIC_API_KEY (Claude, pago) "
+                "ou GEMINI_API_KEY/GOOGLE_API_KEY (Gemini, tem tier gratuito - "
+                "crie em https://aistudio.google.com), ou informe --provider/--api-key explicitamente."
+            )
+
+    try:
+        reader_cls = _PROVIDERS[provider]
+    except KeyError:
+        raise ValueError(f"provider desconhecido: {provider!r} (opcoes: {sorted(_PROVIDERS)})")
+
+    kwargs: dict[str, Any] = {"api_key": api_key}
+    if model:
+        kwargs["model"] = model
+    return reader_cls(**kwargs)
+
+
 # ---------------------------------------------------------------------------
 # 4. PIPELINE PONTA A PONTA - arquivos (PDF/imagem) -> tabela de auditoria
 # ---------------------------------------------------------------------------
@@ -398,7 +507,7 @@ class VisionDocumentReader:
 def run_vision_pipeline(
     file_paths: list[str],
     context: dict[str, Any],
-    reader: Optional[VisionDocumentReader] = None,
+    reader: Optional[BaseVisionDocumentReader] = None,
     min_confidence: float = 0.5,
     mode: str = "two_call",
 ) -> list[tuple[str, str, str]]:
@@ -408,6 +517,9 @@ def run_vision_pipeline(
                 cada página classificada individualmente).
     context: mesmo dicionário usado em `gestorflow_auditoria.run_pipeline`
              (cadastro da proposta, ficha do CNES, datas de referência etc.)
+    reader: qualquer BaseVisionDocumentReader (Anthropic ou Gemini). Sem
+            um, `make_reader()` escolhe automaticamente pela API key
+            disponível no ambiente.
     mode: "two_call" (padrão, mais preciso: classifica e só então extrai
           com o schema certo) ou "single_call" (1 chamada só, mais barato,
           mas classificação e extração saem do mesmo turno do modelo).
@@ -415,7 +527,7 @@ def run_vision_pipeline(
     if mode not in ("two_call", "single_call"):
         raise ValueError('mode deve ser "two_call" ou "single_call"')
 
-    reader = reader or VisionDocumentReader()
+    reader = reader or make_reader()
     documents: dict[DocumentType, DocumentRecord] = {}
     avulsos: list[DocumentRecord] = []
     rows: list[tuple[str, str, str]] = []
@@ -475,15 +587,18 @@ def run_vision_pipeline(
 
 def _parse_date_field(fields_: dict[str, Any]):
     """Tenta achar um campo de data plausível entre os extraídos, para uso
-    na validação da cadeia cronológica (best-effort)."""
-    from datetime import date
+    na validação da cadeia cronológica (best-effort). `fields_` já passou
+    por `_coerce_dates` a essa altura, então o valor normalmente já é um
+    `date` - mas aceita string também (ex.: chamado com dados crus)."""
     for key in ("data", "data_emissao", "data_documento", "data_solicitacao",
                 "data_assinatura", "data_publicacao"):
         val = fields_.get(key)
-        if val:
+        if isinstance(val, date):
+            return val
+        if isinstance(val, str) and val:
             try:
                 return date.fromisoformat(val)
-            except (ValueError, TypeError):
+            except ValueError:
                 continue
     return None
 

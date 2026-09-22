@@ -13,11 +13,22 @@ de dependência/invalidação em cascata entre eles.
   da cadeia cronológica e orquestração do pipeline (`run_pipeline`). A
   extração real de campos fica a cargo de uma função `extract_fields_fn`
   plugada por quem integrar o módulo (ex.: uma chamada a um LLM).
-- **`gestorflow_vision.py`** — extensão que usa a API da Anthropic (Claude)
-  com visão para classificar e extrair campos diretamente de PDFs/imagens
-  de documentos (fotos, scans, capturas de tela de sistemas como
-  SAEP/SIOPS/SIOPE), reaproveitando as mesmas regras do módulo de
-  auditoria como fonte única da verdade dos prompts.
+- **`gestorflow_vision.py`** — extensão com visão computacional para
+  classificar e extrair campos diretamente de PDFs/imagens de documentos
+  (fotos, scans, capturas de tela de sistemas como SAEP/SIOPS/SIOPE),
+  reaproveitando as mesmas regras do módulo de auditoria como fonte
+  única da verdade dos prompts. Suporta dois provedores por trás da
+  mesma interface (`BaseVisionDocumentReader`):
+  - **Claude** (`AnthropicVisionDocumentReader`) — requer
+    `ANTHROPIC_API_KEY`, sem tier gratuito persistente.
+  - **Gemini** (`GeminiVisionDocumentReader`) — requer
+    `GEMINI_API_KEY`/`GOOGLE_API_KEY`, tem tier gratuito (crie uma chave
+    em https://aistudio.google.com). Boa opção para testar o pipeline
+    sem custo antes de decidir migrar para um provedor pago.
+
+  `make_reader()` escolhe automaticamente o provedor pela API key
+  disponível no ambiente (prioriza Anthropic se as duas existirem), ou
+  aceita `provider="anthropic"|"gemini"` explicitamente.
 - **`test_gestorflow_auditoria.py`** — testes unitários das regras de
   conformidade e da cadeia cronológica.
 - **`gestorflow_cli.py`** — CLI de ponta a ponta: recebe arquivos
@@ -32,8 +43,9 @@ de dependência/invalidação em cascata entre eles.
      confiança, ex.: cadeia da AC-Raiz ICP-Brasil publicada pelo ITI em
      https://www.iti.gov.br), também valida a cadeia de certificação;
      sem isso, a cadeia fica marcada como "não verificada".
-  2. **Manuscrita** (`VisionDocumentReader.assess_manual_signature`,
-     em `gestorflow_vision.py`) — para fotos/scans de papel (ou PDF sem
+  2. **Manuscrita** (`BaseVisionDocumentReader.assess_manual_signature`,
+     em `gestorflow_vision.py` - funciona com qualquer provedor) — para
+     fotos/scans de papel (ou PDF sem
      assinatura embutida): o modelo de visão avalia se há uma
      assinatura a caneta plausível, e sinaliza indícios de montagem
      (recorte/colagem) quando houver.
@@ -50,13 +62,22 @@ de dependência/invalidação em cascata entre eles.
 ## Uso via CLI
 
 ```bash
-export ANTHROPIC_API_KEY=sk-ant-...
+# Gemini (tier gratuito) - crie uma chave em https://aistudio.google.com
+export GEMINI_API_KEY=...
+
+# ou Claude (pago)
+# export ANTHROPIC_API_KEY=sk-ant-...
 
 python gestorflow_cli.py \
   --context examples/context_exemplo.json \
   --files documentos/oficio.pdf documentos/rg_presidente.jpg \
   --output resultado.md
 ```
+
+Sem `--provider`, o CLI detecta automaticamente pela API key disponível
+no ambiente (Anthropic tem prioridade se as duas existirem). Para forçar
+um provedor: `--provider gemini` ou `--provider anthropic`, com
+`--model` para sobrescrever o modelo padrão de cada um.
 
 O JSON de contexto segue o schema de `AuditContext`
 (ver [`examples/context_exemplo.json`](examples/context_exemplo.json)):
@@ -98,13 +119,14 @@ for linha in run_pipeline(documentos, extract_fields, contexto):
 ```
 
 Para classificar/extrair diretamente de PDF ou imagem com visão computacional,
-use `gestorflow_vision.run_vision_pipeline` (requer `ANTHROPIC_API_KEY` no
-ambiente e as dependências opcionais em `requirements.txt`).
+use `gestorflow_vision.run_vision_pipeline` (sem `reader` explícito, usa
+`make_reader()` para escolher o provedor pela API key disponível no
+ambiente; requer as dependências opcionais em `requirements.txt`).
 
 ## Testes
 
 ```bash
-python -m unittest test_gestorflow_auditoria.py test_gestorflow_cli.py test_gestorflow_signature.py -v
+python -m unittest test_gestorflow_auditoria.py test_gestorflow_cli.py test_gestorflow_signature.py test_gestorflow_vision.py -v
 ```
 
 `test_gestorflow_signature.py` gera um certificado autoassinado e um PDF
@@ -117,5 +139,6 @@ inspeção contra uma assinatura digital real, não apenas mocks.
 pip install -r requirements.txt
 ```
 
-Inclui `pymupdf`/`anthropic`/`pillow` (visão computacional) e `pyHanko`
+Inclui `pymupdf`/`pillow` (visão computacional), `anthropic` e
+`google-genai` (provedores - instale pelo menos um) e `pyHanko`
 (verificação de assinatura digital).
