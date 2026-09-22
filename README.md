@@ -23,6 +23,29 @@ de dependência/invalidação em cascata entre eles.
 - **`gestorflow_cli.py`** — CLI de ponta a ponta: recebe arquivos
   (PDF/imagem) + um JSON de contexto e roda `gestorflow_vision` sobre
   eles, imprimindo/gravando a tabela final de conformidade.
+- **`gestorflow_signature.py`** — reconhece os DOIS modelos de
+  assinatura de um documento:
+  1. **Digital** (`inspect_pdf`) — para PDFs nativos assinados
+     eletronicamente (PAdES/CAdES): valida integridade, validade
+     criptográfica e cobertura (detecta se o arquivo foi alterado após
+     a assinatura). Com `--trust-roots` (bundle PEM de âncoras de
+     confiança, ex.: cadeia da AC-Raiz ICP-Brasil publicada pelo ITI em
+     https://www.iti.gov.br), também valida a cadeia de certificação;
+     sem isso, a cadeia fica marcada como "não verificada".
+  2. **Manuscrita** (`VisionDocumentReader.assess_manual_signature`,
+     em `gestorflow_vision.py`) — para fotos/scans de papel (ou PDF sem
+     assinatura embutida): o modelo de visão avalia se há uma
+     assinatura a caneta plausível, e sinaliza indícios de montagem
+     (recorte/colagem) quando houver.
+
+  `check_signature()` escolhe automaticamente o método certo por
+  arquivo. **Escopo:** a verificação criptográfica só se aplica a PDF
+  nativo assinado eletronicamente — não existe assinatura digital
+  embutida em foto de papel. Sem `--trust-roots`, o PyHanko tenta (e
+  falha) validar contra o trust store do sistema por padrão, o que
+  imprime um traceback de log no console — isso é ruído esperado da
+  biblioteca, não uma falha; o campo `trusted` do resultado fica `None`
+  nesse caso, indicando "cadeia não verificada".
 
 ## Uso via CLI
 
@@ -45,6 +68,16 @@ da auditoria.
 Use `--mode single_call` para uma chamada só por página (mais barato, mas
 mistura classificação e extração) em vez do padrão `two_call` (classifica
 e só então extrai com o schema certo).
+
+Para também verificar assinaturas (digital + manuscrita), adicione:
+
+```bash
+python gestorflow_cli.py \
+  --context examples/context_exemplo.json \
+  --files documentos/resolucao_assinada.pdf documentos/oficio_escaneado.pdf \
+  --verify-signatures \
+  --trust-roots icp_brasil_raizes.pem
+```
 
 ## Uso programático
 
@@ -71,11 +104,18 @@ ambiente e as dependências opcionais em `requirements.txt`).
 ## Testes
 
 ```bash
-python -m unittest test_gestorflow_auditoria.py test_gestorflow_cli.py -v
+python -m unittest test_gestorflow_auditoria.py test_gestorflow_cli.py test_gestorflow_signature.py -v
 ```
 
-## Instalação (extensão de visão)
+`test_gestorflow_signature.py` gera um certificado autoassinado e um PDF
+assinado de verdade (via PyHanko) em um diretório temporário para testar a
+inspeção contra uma assinatura digital real, não apenas mocks.
+
+## Instalação
 
 ```bash
 pip install -r requirements.txt
 ```
+
+Inclui `pymupdf`/`anthropic`/`pillow` (visão computacional) e `pyHanko`
+(verificação de assinatura digital).

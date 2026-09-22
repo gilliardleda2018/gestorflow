@@ -192,6 +192,35 @@ por campo listado acima.
 """
 
 
+def build_manual_signature_prompt() -> str:
+    return """Você está avaliando se ESTE documento contém uma assinatura
+MANUSCRITA (feita a mão, com caneta) de próprio punho, no campo onde uma
+assinatura é esperada.
+
+Responda APENAS em JSON, sem markdown, sem texto adicional, no formato:
+{"assinatura_presente": true/false,
+ "tipo": "manuscrita" | "digitalizada_sem_tinta" | "carimbo" | "ausente",
+ "localizacao": "descricao breve de onde esta no documento, ou null",
+ "aparenta_autentica": true/false/null,
+ "observacoes": "indicios de rasura, corte, colagem ou montagem, ou null"}
+
+Regras:
+  - "manuscrita": tracos de caneta/tinta, variacao natural de pressao e
+    espessura, assinatura unica e organica.
+  - "digitalizada_sem_tinta": parece uma imagem/recorte colado (ex.: a
+    mesma assinatura repetida de forma identica em varios documentos).
+  - "carimbo": carimbo de "assinado digitalmente"/similar, sem
+    assinatura manuscrita visivel.
+  - "ausente": nao ha assinatura no campo esperado.
+  - aparenta_autentica=false APENAS diante de indicio visual concreto de
+    adulteracao (corte, colagem, proporcao distorcida, fundo
+    inconsistente) - nao avalie caligrafia ou estilo pessoal, apenas
+    indicios tecnicos de montagem de imagem.
+  - aparenta_autentica=null quando nao houver como avaliar (ex.: campo
+    "ausente").
+"""
+
+
 # ---------------------------------------------------------------------------
 # 3. CHAMADA AO MODELO COM VISÃO
 # ---------------------------------------------------------------------------
@@ -201,6 +230,26 @@ class VisionClassification:
     document_type: Optional[DocumentType]
     confidence: float
     indicios_encontrados: list[str]
+
+
+@dataclass
+class ManualSignatureAssessment:
+    """Avaliação de assinatura MANUSCRITA feita pelo modelo de visão,
+    para documentos sem assinatura digital embutida (fotos/scans de
+    papel). Complementa - não substitui - a verificação criptográfica
+    de `gestorflow_signature.py`, que só se aplica a PDFs nativos
+    assinados eletronicamente."""
+
+    presente: bool
+    tipo: str  # "manuscrita" | "digitalizada_sem_tinta" | "carimbo" | "ausente"
+    localizacao: Optional[str]
+    aparenta_autentica: Optional[bool]
+    observacoes: Optional[str]
+
+    @property
+    def legitima(self) -> bool:
+        """Presente, do tipo manuscrita e sem indício visual de adulteração."""
+        return self.presente and self.tipo == "manuscrita" and self.aparenta_autentica is not False
 
 
 class VisionDocumentReader:
@@ -256,6 +305,22 @@ class VisionDocumentReader:
     def extract_fields(self, image_bytes: bytes, doc_type: DocumentType) -> dict[str, Any]:
         raw = self._call_vision(image_bytes, build_extraction_prompt(doc_type))
         return self._parse_json(raw)
+
+    def assess_manual_signature(self, image_bytes: bytes) -> ManualSignatureAssessment:
+        """Avalia se a imagem mostra uma assinatura manuscrita legítima.
+        Use para documentos sem assinatura digital embutida (fotos/scans
+        de papel) - ver `gestorflow_signature.check_signature`, que
+        decide automaticamente entre este método e a verificação
+        criptográfica conforme o tipo de arquivo."""
+        raw = self._call_vision(image_bytes, build_manual_signature_prompt())
+        data = self._parse_json(raw)
+        return ManualSignatureAssessment(
+            presente=bool(data.get("assinatura_presente", False)),
+            tipo=data.get("tipo") or "ausente",
+            localizacao=data.get("localizacao"),
+            aparenta_autentica=data.get("aparenta_autentica"),
+            observacoes=data.get("observacoes"),
+        )
 
     def classify_and_extract(self, image_bytes: bytes) -> tuple[VisionClassification, dict[str, Any]]:
         """Chamada única: classifica e extrai os campos no mesmo turno."""
