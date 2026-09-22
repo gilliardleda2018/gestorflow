@@ -8,7 +8,9 @@ Rodar com:
 
 from __future__ import annotations
 
+import os
 import unittest
+import warnings
 from datetime import date, timedelta
 
 from gestorflow_auditoria import (
@@ -19,6 +21,8 @@ from gestorflow_auditoria import (
     validate_chain,
     validate_declaracao_limites,
 )
+
+EXEMPLO_CONTEXT = os.path.join(os.path.dirname(__file__), "examples", "context_exemplo.json")
 
 
 class TestPlanoDeAplicacao(unittest.TestCase):
@@ -248,6 +252,41 @@ class TestDeclaracaoLimitesForaDaCadeia(unittest.TestCase):
         )
         validate_declaracao_limites(record, date(2026, 6, 15))
         self.assertFalse(record.conformity.conforme)
+
+
+class TestAuditContextFromJson(unittest.TestCase):
+    def test_datas_aninhadas_em_ato_nomeacao_viram_date(self):
+        # examples/context_exemplo.json tem ato_nomeacao_presidente.data_expedicao
+        # como string "YYYY-MM-DD" - from_json precisa converter para date,
+        # senao _check_resolucao_pleito quebra em `inicio.year`.
+        ctx = AuditContext.from_json(EXEMPLO_CONTEXT)
+        self.assertIsInstance(ctx.ato_nomeacao_presidente["data_expedicao"], date)
+        self.assertEqual(ctx.ato_nomeacao_presidente["data_expedicao"], date(2025, 1, 15))
+
+    def test_resolucao_pleito_nao_quebra_com_contexto_de_exemplo(self):
+        ctx = AuditContext.from_json(EXEMPLO_CONTEXT).as_dict()
+        fields_ = dict(
+            numero_resolucao="01/2026", data=date(2026, 3, 1), municipio="Exemplo/MA",
+            objeto="pleito", valor_aprovado=10000.0, unidades=[],
+            signatario="Ciclana da Silva", data_publicacao="2026-03-02",
+        )
+        r = audit_document(DocumentType.RESOLUCAO_PLEITO, "RP-1", fields_, ctx)
+        self.assertTrue(r.conforme, r.pendencias)
+
+    def test_chave_desconhecida_no_json_gera_aviso(self):
+        import json
+        import tempfile
+
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as f:
+            json.dump({"municipio_esperado": "Exemplo/MA"}, f)
+            caminho = f.name
+        try:
+            with warnings.catch_warnings(record=True) as registrados:
+                warnings.simplefilter("always")
+                AuditContext.from_json(caminho)
+            self.assertTrue(any("municipio_esperado" in str(w.message) for w in registrados))
+        finally:
+            os.remove(caminho)
 
 
 if __name__ == "__main__":

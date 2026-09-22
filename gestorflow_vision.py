@@ -33,17 +33,33 @@ import base64
 import io
 import json
 import os
+import re
 from dataclasses import dataclass
+from datetime import date
 from typing import Any, Optional
 
 from gestorflow_auditoria import (
     AUDIT_SPECS,
+    CHAIN_GRAPH,
     CLASSIFICATION_RULES,
     DocumentType,
     DocumentRecord,
     audit_document,
     validate_chain,
     validate_declaracao_limites,
+)
+
+# Tipos que validate_chain()/validate_declaracao_limites() esperam
+# encontrar no dict `documents` chaveado por DocumentType (um único
+# registro por tipo, por design de gestorflow_auditoria.py). Qualquer
+# outro tipo pode aparecer mais de uma vez no mesmo lote (ex.: os 6
+# bimestres do SIOPS/SIOPE, várias páginas de identidade etc.) e por
+# isso NÃO deve ser guardado nesse dict - guardá-lo lá faria cada nova
+# ocorrência sobrescrever silenciosamente a anterior.
+_TIPOS_DA_CADEIA = (
+    set(CHAIN_GRAPH)
+    | {dep for deps in CHAIN_GRAPH.values() for dep in deps}
+    | {DocumentType.DECLARACAO_LIMITES}
 )
 
 # Dependências opcionais - import isolado para permitir rodar só a parte
@@ -221,6 +237,47 @@ Regras:
 """
 
 
+_ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def _coerce_dates(obj: Any) -> Any:
+    """
+    Converte recursivamente strings no formato "YYYY-MM-DD" (o formato
+    pedido nos prompts de extração) em `datetime.date`, para que os
+    campos extraídos pela visão sejam compatíveis com as comparações de
+    data feitas pelas funções `_check_*` de gestorflow_auditoria.py
+    (que esperam `date`, não `str`).
+    """
+    if isinstance(obj, str):
+        if _ISO_DATE_RE.match(obj):
+            try:
+                return date.fromisoformat(obj)
+            except ValueError:
+                return obj
+        return obj
+    if isinstance(obj, list):
+        return [_coerce_dates(item) for item in obj]
+    if isinstance(obj, dict):
+        return {k: _coerce_dates(v) for k, v in obj.items()}
+    return obj
+
+
+def _safe_document_type(tipo_str: Optional[str]) -> Optional[DocumentType]:
+    """
+    Constrói um DocumentType a partir da saída (nao confiavel) do
+    modelo. Um valor que nao corresponde a nenhum tipo conhecido
+    (alucinacao, erro de digitacao, variacao de caixa) vira None em vez
+    de lancar excecao - o chamador trata isso como "NAO CLASSIFICADO",
+    igual ao caso de confianca baixa, em vez de derrubar o lote inteiro.
+    """
+    if not tipo_str:
+        return None
+    try:
+        return DocumentType(tipo_str)
+    except ValueError:
+        return None
+
+
 # ---------------------------------------------------------------------------
 # 3. CHAMADA AO MODELO COM VISÃO
 # ---------------------------------------------------------------------------
@@ -294,8 +351,7 @@ class VisionDocumentReader:
     def classify(self, image_bytes: bytes) -> VisionClassification:
         raw = self._call_vision(image_bytes, build_classification_prompt())
         data = self._parse_json(raw)
-        tipo_str = data.get("tipo")
-        doc_type = DocumentType(tipo_str) if tipo_str else None
+        doc_type = _safe_document_type(data.get("tipo"))
         return VisionClassification(
             document_type=doc_type,
             confidence=float(data.get("confianca", 0.0)),
@@ -304,7 +360,7 @@ class VisionDocumentReader:
 
     def extract_fields(self, image_bytes: bytes, doc_type: DocumentType) -> dict[str, Any]:
         raw = self._call_vision(image_bytes, build_extraction_prompt(doc_type))
-        return self._parse_json(raw)
+        return _coerce_dates(self._parse_json(raw))
 
     def assess_manual_signature(self, image_bytes: bytes) -> ManualSignatureAssessment:
         """Avalia se a imagem mostra uma assinatura manuscrita legítima.
@@ -326,14 +382,13 @@ class VisionDocumentReader:
         """Chamada única: classifica e extrai os campos no mesmo turno."""
         raw = self._call_vision(image_bytes, build_combined_prompt())
         data = self._parse_json(raw)
-        tipo_str = data.get("tipo")
-        doc_type = DocumentType(tipo_str) if tipo_str else None
+        doc_type = _safe_document_type(data.get("tipo"))
         classification = VisionClassification(
             document_type=doc_type,
             confidence=float(data.get("confianca", 0.0)),
             indicios_encontrados=[],
         )
-        return classification, data.get("campos", {})
+        return classification, _coerce_dates(data.get("campos", {}))
 
 
 # ---------------------------------------------------------------------------
@@ -362,6 +417,7 @@ def run_vision_pipeline(
 
     reader = reader or VisionDocumentReader()
     documents: dict[DocumentType, DocumentRecord] = {}
+    avulsos: list[DocumentRecord] = []
     rows: list[tuple[str, str, str]] = []
 
     for path in file_paths:
@@ -384,13 +440,17 @@ def run_vision_pipeline(
                 fields_ = reader.extract_fields(image_bytes, doc_type)
             result = audit_document(doc_type, label_base, fields_, context)
 
-            documents[doc_type] = DocumentRecord(
+            record = DocumentRecord(
                 document_type=doc_type,
                 label=result.document_label,
                 data_documento=_parse_date_field(fields_),
                 is_digital=True,
                 conformity=result,
             )
+            if doc_type in _TIPOS_DA_CADEIA:
+                documents[doc_type] = record
+            else:
+                avulsos.append(record)
 
     validate_chain(documents)
 
@@ -400,7 +460,7 @@ def run_vision_pipeline(
             context["data_referencia_auditoria"],
         )
 
-    for record in documents.values():
+    for record in list(documents.values()) + avulsos:
         conforme = record.conformity.conforme if record.conformity else False
         pendencias = list(record.conformity.pendencias) if record.conformity else []
         if record.invalidado_em_cascata:

@@ -88,16 +88,29 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Erro: arquivo de contexto nao encontrado: {args.context}", file=sys.stderr)
         return 1
 
-    context = AuditContext.from_json(args.context)
-    reader = VisionDocumentReader(api_key=args.api_key, model=args.model)
+    try:
+        context = AuditContext.from_json(args.context)
+    except (ValueError, OSError) as exc:
+        print(f"Erro: contexto invalido em {args.context}: {exc}", file=sys.stderr)
+        return 1
 
-    rows = run_vision_pipeline(
-        args.files,
-        context.as_dict(),
-        reader=reader,
-        min_confidence=args.min_confidence,
-        mode=args.mode,
-    )
+    try:
+        reader = VisionDocumentReader(api_key=args.api_key, model=args.model)
+    except RuntimeError as exc:
+        print(f"Erro: {exc}", file=sys.stderr)
+        return 1
+
+    try:
+        rows = run_vision_pipeline(
+            args.files,
+            context.as_dict(),
+            reader=reader,
+            min_confidence=args.min_confidence,
+            mode=args.mode,
+        )
+    except Exception as exc:
+        print(f"Erro ao rodar o pipeline de visao: {exc}", file=sys.stderr)
+        return 1
 
     tabela = format_table(rows)
     print(tabela)

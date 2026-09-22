@@ -352,10 +352,14 @@ class AuditContext:
     def from_json(cls, path: str) -> "AuditContext":
         """
         Carrega o contexto de um JSON. Datas devem vir como "YYYY-MM-DD"
-        (convertidas automaticamente); `resolucoes_ja_usadas` como lista
+        (convertidas automaticamente, inclusive as aninhadas em
+        `ato_nomeacao_presidente`, usadas em comparacoes de data por
+        `_check_resolucao_pleito`); `resolucoes_ja_usadas` como lista
         (convertida para set).
         """
         import json as _json
+        import warnings
+
         with open(path, encoding="utf-8") as f:
             raw = _json.load(f)
 
@@ -364,7 +368,19 @@ class AuditContext:
         if "resolucoes_ja_usadas" in raw:
             raw["resolucoes_ja_usadas"] = set(raw["resolucoes_ja_usadas"])
 
+        ato_nomeacao = raw.get("ato_nomeacao_presidente")
+        if isinstance(ato_nomeacao, dict):
+            for campo in ("data_expedicao", "data_publicacao"):
+                if ato_nomeacao.get(campo):
+                    ato_nomeacao[campo] = date.fromisoformat(ato_nomeacao[campo])
+
         campos_validos = {f_.name for f_ in cls.__dataclass_fields__.values()}
+        desconhecidos = set(raw) - campos_validos
+        if desconhecidos:
+            warnings.warn(
+                f"AuditContext.from_json: chave(s) desconhecida(s) no JSON de contexto, "
+                f"ignorada(s) silenciosamente: {sorted(desconhecidos)} (verifique se nao e erro de digitacao)"
+            )
         dados = {k: v for k, v in raw.items() if k in campos_validos}
         return cls(**dados)
 
