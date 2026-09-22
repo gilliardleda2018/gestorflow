@@ -254,6 +254,13 @@ Regras:
 
 _ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
+# Barra invertida solta (nao seguida de um escape valido de JSON) na
+# resposta do modelo - achado rodando contra documentos reais: o modelo
+# as vezes escreve um valor com "\" literal (ex.: algo lido como caminho
+# de arquivo ou um numero de processo) sem escapar, o que json.loads()
+# rejeita de cara com "Invalid \uXXXX escape".
+_BARRA_INVALIDA_RE = re.compile(r'\\(?!["\\/bfnrtu])')
+
 
 def _coerce_dates(obj: Any) -> Any:
     """
@@ -365,7 +372,16 @@ class BaseVisionDocumentReader:
     @staticmethod
     def _parse_json(raw: str) -> dict[str, Any]:
         cleaned = raw.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
-        return json.loads(cleaned)
+        try:
+            return json.loads(cleaned)
+        except json.JSONDecodeError:
+            # Tenta reparar barras invertidas soltas (nao seguidas de um
+            # escape valido de JSON) antes de desistir - ver
+            # _BARRA_INVALIDA_RE. Se ainda assim nao parsear, deixa o
+            # JSONDecodeError original subir (o chamador trata como
+            # falha dessa pagina, sem derrubar o lote inteiro).
+            reparado = _BARRA_INVALIDA_RE.sub(r"\\\\", cleaned)
+            return json.loads(reparado)
 
     def classify(self, image_bytes: bytes) -> VisionClassification:
         raw = self._call_vision_retrying(image_bytes, build_classification_prompt())

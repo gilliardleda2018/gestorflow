@@ -31,6 +31,44 @@ from gestorflow_vision import (
 )
 
 
+class TestParseJsonTolerante(unittest.TestCase):
+    def test_json_valido_continua_normal(self):
+        self.assertEqual(
+            BaseVisionDocumentReader._parse_json('{"a": 1, "b": "texto"}'),
+            {"a": 1, "b": "texto"},
+        )
+
+    def test_remove_cercas_de_markdown(self):
+        self.assertEqual(BaseVisionDocumentReader._parse_json('```json\n{"a": 1}\n```'), {"a": 1})
+
+    def test_repara_barra_invertida_solta(self):
+        # Achado rodando contra documentos reais: o modelo as vezes
+        # devolve um valor com "\" literal sem escapar (ex.: algo lido
+        # como "05\2026"), o que json.loads() rejeita de cara.
+        bruto = r'{"numero_processo": "05\2026"}'
+        self.assertEqual(BaseVisionDocumentReader._parse_json(bruto), {"numero_processo": "05\\2026"})
+
+    def test_json_ja_valido_nao_passa_pelo_reparo(self):
+        # \n, \" e \\ sao escapes JSON validos - json.loads() aceita de
+        # primeira, sem precisar do reparo de barra invalida.
+        bruto = '{"texto": "linha1\\nlinha2", "aspas": "ele disse \\"oi\\"", "barra": "a\\\\b"}'
+        resultado = BaseVisionDocumentReader._parse_json(bruto)
+        self.assertEqual(resultado["texto"], "linha1\nlinha2")
+        self.assertEqual(resultado["aspas"], 'ele disse "oi"')
+        self.assertEqual(resultado["barra"], "a\\b")
+
+    def test_reparo_preserva_escape_valido_ao_lado_do_invalido(self):
+        # Mistura um escape valido (\n) com um invalido (\q) no mesmo
+        # valor - o reparo so pode mexer no invalido.
+        bruto = '{"a": "linha1\\nlinha2 e \\q ruim"}'
+        resultado = BaseVisionDocumentReader._parse_json(bruto)
+        self.assertEqual(resultado["a"], "linha1\nlinha2 e \\q ruim")
+
+    def test_json_irreparavel_ainda_lanca(self):
+        with self.assertRaises(Exception):
+            BaseVisionDocumentReader._parse_json("isto nao e JSON de jeito nenhum")
+
+
 class TestCoerceDates(unittest.TestCase):
     def test_converte_string_iso_para_date(self):
         self.assertEqual(_coerce_dates("2026-09-21"), date(2026, 9, 21))
