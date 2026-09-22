@@ -37,6 +37,7 @@ automaticamente pelo que estiver configurado no ambiente, ou informe
 from __future__ import annotations
 
 import base64
+import concurrent.futures
 import io
 import json
 import os
@@ -533,12 +534,58 @@ def make_reader(
 # 4. PIPELINE PONTA A PONTA - arquivos (PDF/imagem) -> tabela de auditoria
 # ---------------------------------------------------------------------------
 
+def _processar_pagina(
+    reader: BaseVisionDocumentReader,
+    label_base: str,
+    image_bytes: bytes,
+    mode: str,
+    min_confidence: float,
+    context: dict[str, Any],
+) -> tuple[str, Any, Any]:
+    """
+    Roda a classificacao/extracao/auditoria de UMA pagina e devolve um
+    resultado descritivo, sem tocar em nenhum estado compartilhado -
+    seguro para chamar de varias threads ao mesmo tempo. Quem chama
+    aplica o resultado (monta `documents`/`avulsos`/`rows`) depois, na
+    ordem original, fora da parte paralela.
+    """
+    try:
+        if mode == "single_call":
+            classification, fields_ = reader.classify_and_extract(image_bytes)
+        else:
+            classification = reader.classify(image_bytes)
+            fields_ = {}
+
+        if classification.document_type is None or classification.confidence < min_confidence:
+            return ("NAO_CLASSIFICADO", label_base, f"confianca={classification.confidence:.2f}")
+
+        doc_type = classification.document_type
+        if mode == "two_call":
+            fields_ = reader.extract_fields(image_bytes, doc_type)
+        result = audit_document(doc_type, label_base, fields_, context)
+
+        record = DocumentRecord(
+            document_type=doc_type,
+            label=result.document_label,
+            data_documento=_parse_date_field(fields_),
+            is_digital=True,
+            conformity=result,
+        )
+        return ("OK", doc_type, record)
+    except Exception as exc:
+        # Uma pagina com erro (falha persistente de API, resposta
+        # nao-JSON, tipo classificado invalido etc.) nao pode derrubar
+        # o lote inteiro e perder o que ja foi processado.
+        return ("ERRO", label_base, str(exc))
+
+
 def run_vision_pipeline(
     file_paths: list[str],
     context: dict[str, Any],
     reader: Optional[BaseVisionDocumentReader] = None,
     min_confidence: float = 0.5,
     mode: str = "two_call",
+    max_workers: int = 4,
 ) -> list[tuple[str, str, str]]:
     """
     file_paths: lista de caminhos de PDF ou imagem (um documento por
@@ -552,6 +599,12 @@ def run_vision_pipeline(
     mode: "two_call" (padrão, mais preciso: classifica e só então extrai
           com o schema certo) ou "single_call" (1 chamada só, mais barato,
           mas classificação e extração saem do mesmo turno do modelo).
+    max_workers: quantas páginas processar em paralelo (cada uma faz 1-2
+                 chamadas de API independentes das demais). Mais alto =
+                 lote termina mais rápido, mas aumenta o risco de esbarrar
+                 no limite de taxa do tier gratuito (que já tem retry com
+                 backoff para isso - ver `_call_vision_retrying`). Use
+                 max_workers=1 para o comportamento sequencial antigo.
     """
     if mode not in ("two_call", "single_call"):
         raise ValueError('mode deve ser "two_call" ou "single_call"')
@@ -561,6 +614,8 @@ def run_vision_pipeline(
     avulsos: list[DocumentRecord] = []
     rows: list[tuple[str, str, str]] = []
 
+    tarefas: list[str] = []  # labels, na mesma ordem/indice que imagens_por_tarefa
+    imagens_por_tarefa: list[bytes] = []
     for path in file_paths:
         try:
             paginas = load_as_images(path)
@@ -570,60 +625,55 @@ def run_vision_pipeline(
 
         for page_num, image_bytes in enumerate(paginas, start=1):
             label_base = os.path.basename(path) + (f" (pág. {page_num})" if path.lower().endswith(".pdf") else "")
+            tarefas.append(label_base)
+            imagens_por_tarefa.append(image_bytes)
 
-            # Uma pagina com erro (falha persistente de API, resposta
-            # nao-JSON, tipo classificado invalido etc.) nao pode derrubar
-            # o lote inteiro e perder o que ja foi processado - registra
-            # a falha nessa linha e segue para a proxima pagina/arquivo.
-            try:
-                if mode == "single_call":
-                    classification, fields_ = reader.classify_and_extract(image_bytes)
-                else:
-                    classification = reader.classify(image_bytes)
-                    fields_ = {}
+    # Processa as paginas em paralelo (cada uma e independente das
+    # demais), mas aplica os resultados na ORDEM ORIGINAL da lista de
+    # arquivos - saida determinística e, numa colisao de tipo da cadeia,
+    # o "sobrescrito" continua sendo sempre o arquivo mais cedo na lista
+    # informada, nao o que a API respondeu primeiro.
+    resultados: list[Optional[tuple[str, Any, Any]]] = [None] * len(tarefas)
+    if tarefas:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futuro_para_indice = {
+                executor.submit(
+                    _processar_pagina, reader, label_base, image_bytes, mode, min_confidence, context
+                ): i
+                for i, (label_base, image_bytes) in enumerate(zip(tarefas, imagens_por_tarefa))
+            }
+            for futuro in concurrent.futures.as_completed(futuro_para_indice):
+                resultados[futuro_para_indice[futuro]] = futuro.result()
 
-                if classification.document_type is None or classification.confidence < min_confidence:
-                    rows.append((label_base, "NAO CLASSIFICADO",
-                                 f"confianca={classification.confidence:.2f}"))
-                    continue
-
-                doc_type = classification.document_type
-                if mode == "two_call":
-                    fields_ = reader.extract_fields(image_bytes, doc_type)
-                result = audit_document(doc_type, label_base, fields_, context)
-
-                record = DocumentRecord(
-                    document_type=doc_type,
-                    label=result.document_label,
-                    data_documento=_parse_date_field(fields_),
-                    is_digital=True,
-                    conformity=result,
-                )
-                if doc_type in _TIPOS_DA_CADEIA:
-                    anterior = documents.get(doc_type)
-                    if anterior is not None:
-                        # A cadeia cronologica exige exatamente 1 documento
-                        # por tipo (validate_chain nao suporta duplicata),
-                        # entao mantem so o mais recente - mas registra a
-                        # colisao em vez de descartar o anterior em
-                        # silencio. Colisao real costuma ser confusao de
-                        # classificacao entre tipos parecidos (ex.: o
-                        # proprio PDF de especificacao alerta que
-                        # Resolucao do PAS e Resolucao do Pleito podem se
-                        # confundir) ou paginas do mesmo documento
-                        # classificadas separadamente.
-                        rows.append((
-                            anterior.label, "SOBRESCRITO",
-                            f"tambem classificado como {doc_type.value} - substituido por '{label_base}' "
-                            "(a cadeia cronologica aceita so 1 documento por tipo; confira se nao houve "
-                            "confusao de classificacao ou se as paginas pertencem ao mesmo documento)",
-                        ))
-                    documents[doc_type] = record
-                else:
-                    avulsos.append(record)
-            except Exception as exc:
-                rows.append((label_base, "ERRO", str(exc)))
-                continue
+    for tipo, a, b in resultados:
+        if tipo == "NAO_CLASSIFICADO":
+            rows.append((a, "NAO CLASSIFICADO", b))
+        elif tipo == "ERRO":
+            rows.append((a, "ERRO", b))
+        else:  # "OK"
+            doc_type, record = a, b
+            if doc_type in _TIPOS_DA_CADEIA:
+                anterior = documents.get(doc_type)
+                if anterior is not None:
+                    # A cadeia cronologica exige exatamente 1 documento
+                    # por tipo (validate_chain nao suporta duplicata),
+                    # entao mantem so o mais recente - mas registra a
+                    # colisao em vez de descartar o anterior em
+                    # silencio. Colisao real costuma ser confusao de
+                    # classificacao entre tipos parecidos (ex.: o
+                    # proprio PDF de especificacao alerta que
+                    # Resolucao do PAS e Resolucao do Pleito podem se
+                    # confundir) ou paginas do mesmo documento
+                    # classificadas separadamente.
+                    rows.append((
+                        anterior.label, "SOBRESCRITO",
+                        f"tambem classificado como {doc_type.value} - substituido por '{record.label}' "
+                        "(a cadeia cronologica aceita so 1 documento por tipo; confira se nao houve "
+                        "confusao de classificacao ou se as paginas pertencem ao mesmo documento)",
+                    ))
+                documents[doc_type] = record
+            else:
+                avulsos.append(record)
 
     validate_chain(documents)
 

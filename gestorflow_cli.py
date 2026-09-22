@@ -64,6 +64,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--mode", choices=["two_call", "single_call"], default="two_call",
                          help="two_call (padrao, mais preciso) ou single_call (mais barato)")
     parser.add_argument("--min-confidence", type=float, default=0.5)
+    parser.add_argument("--workers", type=int, default=4,
+                         help="Paginas processadas em paralelo (cada uma faz chamadas de API independentes). "
+                              "Use 1 para o comportamento sequencial antigo")
     parser.add_argument("--output", help="Se informado, grava a tabela em markdown neste caminho")
     parser.add_argument("--provider", choices=["anthropic", "gemini"], default=None,
                          help="Provedor de visao. Sem isso, detecta pela API key disponivel no ambiente")
@@ -109,6 +112,7 @@ def main(argv: list[str] | None = None) -> int:
             reader=reader,
             min_confidence=args.min_confidence,
             mode=args.mode,
+            max_workers=args.workers,
         )
     except Exception as exc:
         print(f"Erro ao rodar o pipeline de visao: {exc}", file=sys.stderr)

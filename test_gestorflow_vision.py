@@ -96,6 +96,7 @@ class TestRunVisionPipelineNaoSobrescreveMesmoTipo(unittest.TestCase):
                 context={},
                 reader=reader,
                 min_confidence=0.5,
+                max_workers=1,  # mocks com side_effect em lista dependem da ordem das chamadas
             )
         self.assertEqual(len(rows), 2)
         labels = {r[0] for r in rows}
@@ -123,6 +124,7 @@ class TestRunVisionPipelineNaoSobrescreveMesmoTipo(unittest.TestCase):
                 context={},
                 reader=reader,
                 min_confidence=0.5,
+                max_workers=1,  # mocks com side_effect em lista dependem da ordem das chamadas
             )
         self.assertEqual(len(rows), 2)
         status_por_arquivo = {r[0].split(" (")[0]: r[1] for r in rows}
@@ -282,6 +284,7 @@ class TestRunVisionPipelineResilienteAFalha(unittest.TestCase):
                 context={},
                 reader=reader,
                 min_confidence=0.5,
+                max_workers=1,  # mocks com side_effect em lista dependem da ordem das chamadas
             )
         status_por_arquivo = {r[0].split(" (")[0]: r[1] for r in rows}
         self.assertEqual(status_por_arquivo["falha.pdf"], "ERRO")
@@ -307,6 +310,55 @@ class TestRunVisionPipelineResilienteAFalha(unittest.TestCase):
         status_por_arquivo = {r[0].split(" (")[0]: r[1] for r in rows}
         self.assertEqual(status_por_arquivo["corrompido.pdf"], "ERRO")
         self.assertNotEqual(status_por_arquivo["ok.pdf"], "ERRO")
+
+
+class TestRunVisionPipelineParalelo(unittest.TestCase):
+    def test_paginas_processam_em_paralelo_e_cada_uma_recebe_a_resposta_certa(self):
+        # side_effect por FUNCAO (indexado pelo conteudo da imagem, nao
+        # pela ordem de chamada) - com max_workers>1 a ordem de chamada
+        # real nao e garantida, entao a resposta certa so pode depender
+        # do que foi pedido, nunca de "qual chegou primeiro".
+        respostas = {
+            b"p1": MagicMock(document_type=DocumentType.OFICIO_SOLICITACAO_RECURSOS, confidence=0.9),
+            b"p2": MagicMock(document_type=DocumentType.COMPROVANTE_SAEP, confidence=0.9),
+            b"p3": MagicMock(document_type=DocumentType.LEI_CMS, confidence=0.9),
+        }
+        reader = MagicMock()
+        reader.classify.side_effect = lambda image_bytes: respostas[image_bytes]
+        reader.extract_fields.return_value = {}
+
+        with patch(
+            "gestorflow_vision.load_as_images",
+            side_effect=[[b"p1"], [b"p2"], [b"p3"]],
+        ):
+            rows = run_vision_pipeline(
+                ["oficio.pdf", "saep.pdf", "lei.pdf"],
+                context={},
+                reader=reader,
+                min_confidence=0.5,
+                max_workers=3,
+            )
+
+        self.assertEqual(len(rows), 3)
+        labels = {r[0].split(" (")[0] for r in rows}
+        self.assertEqual(labels, {"oficio.pdf", "saep.pdf", "lei.pdf"})
+        self.assertEqual(reader.classify.call_count, 3)
+
+    def test_max_workers_1_continua_equivalente_a_sequencial(self):
+        reader = MagicMock()
+        reader.classify.return_value = MagicMock(
+            document_type=DocumentType.OFICIO_SOLICITACAO_RECURSOS, confidence=0.9
+        )
+        reader.extract_fields.return_value = {}
+        with patch("gestorflow_vision.load_as_images", side_effect=[[b"p1"]]):
+            rows_seq = run_vision_pipeline(
+                ["oficio.pdf"], context={}, reader=reader, min_confidence=0.5, max_workers=1,
+            )
+        with patch("gestorflow_vision.load_as_images", side_effect=[[b"p1"]]):
+            rows_par = run_vision_pipeline(
+                ["oficio.pdf"], context={}, reader=reader, min_confidence=0.5, max_workers=4,
+            )
+        self.assertEqual(rows_seq, rows_par)
 
 
 if __name__ == "__main__":
