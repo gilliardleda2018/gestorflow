@@ -427,10 +427,13 @@ class GeminiVisionDocumentReader(BaseVisionDocumentReader):
 
     Confirme o nome do modelo atual em aistudio.google.com/models - o
     catálogo de modelos gratuitos muda com o tempo; passe `model=` para
-    sobrescrever o padrão se o nome abaixo não existir mais.
+    sobrescrever o padrão se o nome abaixo não existir mais. O padrão é
+    um modelo "flash-lite": mais barato e com cota gratuita mais folgada
+    que os modelos "flash"/"pro" principais, adequado para a extração
+    estruturada que este projeto faz.
     """
 
-    def __init__(self, api_key: Optional[str] = None, model: str = "gemini-2.5-flash"):
+    def __init__(self, api_key: Optional[str] = None, model: str = "gemini-3.5-flash-lite"):
         if genai is None:
             raise RuntimeError("Instale o SDK: pip install google-genai")
         resolved_key = api_key or os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
