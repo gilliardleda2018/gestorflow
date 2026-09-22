@@ -207,12 +207,18 @@ def format_report(report: PdfSignatureReport) -> str:
 # ---------------------------------------------------------------------------
 
 @dataclass
+class ManualSignaturePageResult:
+    page_num: int  # 1-indexado
+    assessment: ManualSignatureAssessment
+
+
+@dataclass
 class SignatureCheckResult:
     path: str
     metodo: str  # "digital" | "manual" | "sem_assinatura"
     legitima: Optional[bool]  # None quando nao ha assinatura para avaliar
     digital: Optional[PdfSignatureReport] = None
-    manual: Optional[ManualSignatureAssessment] = None
+    manual: list[ManualSignaturePageResult] = field(default_factory=list)
     erro: Optional[str] = None
 
 
@@ -231,10 +237,12 @@ def check_signature(
       2. Assinatura MANUSCRITA: caso contrário (imagem, ou PDF sem
          assinatura digital embutida - ex.: scan de papel salvo como
          PDF), usa o modelo de visão para avaliar se há uma assinatura
-         a caneta plausível na página. Método = "manual". Requer
-         `reader` (qualquer BaseVisionDocumentReader - Anthropic ou
-         Gemini) - sem ele, retorna metodo="sem_assinatura" com erro
-         explicando a limitação.
+         a caneta plausível. Verifica a PRIMEIRA e a ÚLTIMA página do
+         documento (onde a assinatura normalmente aparece - abertura e
+         fecho -, sem gastar uma chamada por página de um processo
+         inteiro). Método = "manual". Requer `reader` (qualquer
+         BaseVisionDocumentReader - Anthropic ou Gemini) - sem ele,
+         retorna metodo="sem_assinatura" com erro explicando a limitação.
 
     Isso cobre tanto o processo 100% digital (documento gerado e
     assinado eletronicamente) quanto o processo com papel assinado à
@@ -268,11 +276,22 @@ def check_signature(
     if not paginas:
         return SignatureCheckResult(path=file_path, metodo="sem_assinatura", legitima=None, erro="documento vazio")
 
-    assessment = reader.assess_manual_signature(paginas[0])
+    # Primeira e ultima pagina (a mesma pagina quando o documento tem so
+    # uma) - e onde a assinatura normalmente aparece, sem precisar avaliar
+    # cada pagina de um processo com dezenas delas.
+    indices = sorted({0, len(paginas) - 1})
+    resultados = [
+        ManualSignaturePageResult(page_num=i + 1, assessment=reader.assess_manual_signature(paginas[i]))
+        for i in indices
+    ]
+
+    presentes = [r for r in resultados if r.assessment.presente]
+    legitima = any(r.assessment.legitima for r in presentes) if presentes else None
+
     return SignatureCheckResult(
         path=file_path, metodo="manual",
-        legitima=(assessment.legitima if assessment.presente else None),
-        manual=assessment,
+        legitima=legitima,
+        manual=resultados,
     )
 
 
@@ -282,14 +301,15 @@ def format_check_result(result: SignatureCheckResult) -> str:
     linhas = [f"## {os.path.basename(result.path)}"]
     if result.erro:
         linhas.append(f"- ERRO: {result.erro}")
-    elif result.manual is not None:
-        m = result.manual
-        status = "LEGITIMA" if m.legitima else ("AUSENTE" if not m.presente else "SUSPEITA")
-        linhas.append(f"- Assinatura manuscrita: {status}")
-        linhas.append(f"  - Tipo: {m.tipo} | Localizacao: {m.localizacao or '?'}")
-        linhas.append(f"  - Aparenta autentica: {m.aparenta_autentica}")
-        if m.observacoes:
-            linhas.append(f"  - Observacoes: {m.observacoes}")
+    elif result.manual:
+        for pagina in result.manual:
+            m = pagina.assessment
+            status = "LEGITIMA" if m.legitima else ("AUSENTE" if not m.presente else "SUSPEITA")
+            linhas.append(f"- Pagina {pagina.page_num} - assinatura manuscrita: {status}")
+            linhas.append(f"  - Tipo: {m.tipo} | Localizacao: {m.localizacao or '?'}")
+            linhas.append(f"  - Aparenta autentica: {m.aparenta_autentica}")
+            if m.observacoes:
+                linhas.append(f"  - Observacoes: {m.observacoes}")
     else:
         linhas.append("- Nenhuma assinatura encontrada")
     return "\n".join(linhas)

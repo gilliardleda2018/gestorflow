@@ -401,8 +401,12 @@ def _check_plano_aplicacao(fields_: dict, ctx: dict) -> list[str]:
         if fields_.get(campo) and cadastro.get(campo) and fields_[campo] != cadastro[campo]:
             pend.append(f'"{campo}" divergente do cadastro da proposta')
 
-    unidades_doc = {u["cnes"]: u for u in fields_.get("unidades", [])}
-    unidades_cad = {u["cnes"]: u for u in cadastro.get("unidades", [])}
+    # `.get(chave, [])` nao basta: o prompt de extracao instrui o modelo a
+    # devolver `null` (nao omitir a chave) quando o campo esta ausente, e
+    # `.get()` so aplica o default para chave AUSENTE, nao para valor None
+    # explicito - por isso o `or []` extra.
+    unidades_doc = {u["cnes"]: u for u in (fields_.get("unidades") or [])}
+    unidades_cad = {u["cnes"]: u for u in (cadastro.get("unidades") or [])}
     ficha_cnes = ctx.get("ficha_cnes", {})
 
     for cnes, unidade in unidades_doc.items():

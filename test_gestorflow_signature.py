@@ -144,7 +144,7 @@ class TestCheckSignatureOrquestrador(unittest.TestCase):
         self.assertEqual(resultado.metodo, "digital")
         self.assertTrue(resultado.legitima)
         self.assertIsInstance(resultado.digital, PdfSignatureReport)
-        self.assertIsNone(resultado.manual)
+        self.assertEqual(resultado.manual, [])
 
     def test_pdf_sem_assinatura_digital_cai_para_avaliacao_manual(self):
         reader = MagicMock()
@@ -181,6 +181,39 @@ class TestCheckSignatureOrquestrador(unittest.TestCase):
         )
         resultado = check_signature(self.blank_pdf, reader=reader)
         self.assertFalse(resultado.legitima)
+
+    def test_documento_multipagina_checa_so_primeira_e_ultima(self):
+        # Processo com varias paginas - a assinatura normalmente esta na
+        # abertura e no fecho, entao nao vale a pena (nem o custo de API)
+        # avaliar cada pagina do meio.
+        multipagina_pdf = os.path.join(self.tmp.name, "multipagina.pdf")
+        doc = fitz.open()
+        for _ in range(5):
+            doc.new_page()
+        doc.save(multipagina_pdf)
+        doc.close()
+
+        reader = MagicMock()
+        reader.assess_manual_signature.return_value = ManualSignatureAssessment(
+            presente=True, tipo="manuscrita", localizacao="rodape",
+            aparenta_autentica=True, observacoes=None,
+        )
+        resultado = check_signature(multipagina_pdf, reader=reader)
+
+        self.assertEqual(reader.assess_manual_signature.call_count, 2)
+        self.assertEqual([p.page_num for p in resultado.manual], [1, 5])
+        self.assertTrue(resultado.legitima)
+
+    def test_documento_uma_pagina_checa_so_uma_vez(self):
+        reader = MagicMock()
+        reader.assess_manual_signature.return_value = ManualSignatureAssessment(
+            presente=True, tipo="manuscrita", localizacao="rodape",
+            aparenta_autentica=True, observacoes=None,
+        )
+        resultado = check_signature(self.blank_pdf, reader=reader)
+
+        self.assertEqual(reader.assess_manual_signature.call_count, 1)
+        self.assertEqual([p.page_num for p in resultado.manual], [1])
 
 
 class TestManualSignatureAssessment(unittest.TestCase):

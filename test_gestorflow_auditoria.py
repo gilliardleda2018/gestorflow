@@ -65,6 +65,25 @@ class TestPlanoDeAplicacao(unittest.TestCase):
         self.assertFalse(r.conforme)
         self.assertTrue(any("2222222" in p for p in r.pendencias))
 
+    def test_nao_quebra_quando_unidades_vem_null_do_modelo(self):
+        # Regressao: o prompt de extracao instrui o modelo a devolver
+        # `null` (nao omitir a chave) para campo ausente - fields_.get()
+        # com "unidades": None nao pode lancar TypeError ao iterar.
+        fields_ = self._fields(unidades=None)
+        r = audit_document(DocumentType.PLANO_DE_APLICACAO, "PA-4", fields_, self._ctx())
+        self.assertFalse(r.conforme)  # unidades do cadastro ficam ausentes no documento
+
+    def test_nao_quebra_quando_unidades_do_cadastro_vem_null(self):
+        ctx = self._ctx(cadastro_proposta={
+            "municipio": "Exemplo/MA", "prefeito": "Fulano", "valor_recurso": 10000.0,
+            "resolucao_cms": "01/2026", "unidades": None,
+        })
+        # Nao lanca excecao; unidades do documento nao batem com o cadastro
+        # (None) nem com a Ficha do CNES (vazia) -> nao conforme, sem crash.
+        r = audit_document(DocumentType.PLANO_DE_APLICACAO, "PA-5", self._fields(), ctx)
+        self.assertFalse(r.conforme)
+        self.assertTrue(any("localizado na Ficha do CNES" in p for p in r.pendencias))
+
 
 class TestResolucaoPleito(unittest.TestCase):
     def _ctx(self):
