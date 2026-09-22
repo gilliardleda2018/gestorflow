@@ -1,0 +1,380 @@
+"""
+GestorFlow - Extensão com Visão Computacional (PDF / Imagem)
+==============================================================
+
+Complementa `gestorflow_auditoria.py`: em vez de receber texto já extraído,
+este módulo recebe PDFs ou imagens (fotos, scans, capturas de tela de
+sistemas como SAEP/SIOPS/SIOPE) e usa um modelo com VISÃO para:
+
+  1. Classificar o tipo de documento (com base nos mesmos indícios de
+     CLASSIFICATION_RULES);
+  2. Extrair os campos obrigatórios por FUNÇÃO SEMÂNTICA (mesma lógica dos
+     prompts de auditoria do PDF original), devolvendo JSON estruturado.
+
+Por que visão em vez de OCR tradicional (Tesseract, etc.)?
+  - Muitos documentos têm layout variável entre municípios/bancos (o
+    próprio PDF de origem diz isso explicitamente em vários prompts).
+  - Há carimbos, assinaturas manuscritas, fotos (RG), tabelas complexas
+    (extrato bancário, SIOPS) e telas de sistema (SAEP, validação TCE) -
+    um modelo de visão lida melhor com isso do que OCR + regex posicional.
+  - A extração "por função semântica, não por posição" pedida nos prompts
+    originais é exatamente o que um modelo multimodal faz bem.
+
+Dependências (instalar no ambiente onde este script for executado):
+    pip install pymupdf anthropic pillow
+
+Requer uma ANTHROPIC_API_KEY configurada no ambiente para as chamadas
+reais ao modelo.
+"""
+
+from __future__ import annotations
+
+import base64
+import io
+import json
+import os
+from dataclasses import dataclass
+from typing import Any, Optional
+
+from gestorflow_auditoria import (
+    AUDIT_SPECS,
+    CLASSIFICATION_RULES,
+    DocumentType,
+    DocumentRecord,
+    audit_document,
+    validate_chain,
+    validate_declaracao_limites,
+)
+
+# Dependências opcionais - import isolado para permitir rodar só a parte
+# de montagem de prompts sem precisar delas instaladas.
+try:
+    import fitz  # PyMuPDF
+except ImportError:
+    fitz = None
+
+try:
+    import anthropic
+except ImportError:
+    anthropic = None
+
+
+# ---------------------------------------------------------------------------
+# 1. RASTERIZAÇÃO - PDF -> lista de imagens PNG (bytes)
+# ---------------------------------------------------------------------------
+
+def pdf_to_images(pdf_path: str, dpi: int = 200) -> list[bytes]:
+    """Converte cada página de um PDF em PNG (bytes), pronto para visão."""
+    if fitz is None:
+        raise RuntimeError("Instale pymupdf: pip install pymupdf")
+
+    images: list[bytes] = []
+    doc = fitz.open(pdf_path)
+    zoom = dpi / 72
+    matrix = fitz.Matrix(zoom, zoom)
+    for page in doc:
+        pix = page.get_pixmap(matrix=matrix)
+        images.append(pix.tobytes("png"))
+    doc.close()
+    return images
+
+
+def load_image_bytes(path: str) -> bytes:
+    with open(path, "rb") as f:
+        return f.read()
+
+
+def load_as_images(path: str) -> list[bytes]:
+    """Entrada única: aceita .pdf (multi-página) ou imagem (.png/.jpg/...)."""
+    if path.lower().endswith(".pdf"):
+        return pdf_to_images(path)
+    return [load_image_bytes(path)]
+
+
+def _b64(image_bytes: bytes) -> str:
+    return base64.b64encode(image_bytes).decode("utf-8")
+
+
+def _media_type_for(image_bytes: bytes) -> str:
+    # Assinatura simples de PNG vs JPEG
+    if image_bytes[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    return "image/jpeg"
+
+
+# ---------------------------------------------------------------------------
+# 2. PROMPTS - montados dinamicamente a partir das mesmas regras usadas no
+#    classificador/auditor "por texto" (uma única fonte da verdade)
+# ---------------------------------------------------------------------------
+
+def build_classification_prompt() -> str:
+    tipos_txt = []
+    for doc_type, rule in CLASSIFICATION_RULES.items():
+        indicios = "\n     - ".join(rule.indicios)
+        tipos_txt.append(f'  * "{doc_type.value}":\n     - {indicios}')
+    catalogo = "\n".join(tipos_txt)
+
+    return f"""Você é um classificador de documentos de auditoria de repasses
+Fundo a Fundo (saúde). Olhe a imagem e identifique qual dos tipos abaixo ela
+representa, com base nos indícios visuais e textuais de cada um.
+
+Tipos possíveis e seus indícios:
+{catalogo}
+
+Responda APENAS em JSON, sem markdown, sem texto adicional, no formato:
+{{"tipo": "<valor exato de um dos tipos acima>", "confianca": <0.0 a 1.0>,
+  "indicios_encontrados": ["..."]}}
+
+Se a imagem não corresponder a nenhum tipo com confiança razoável, use
+"tipo": null.
+"""
+
+
+def build_combined_prompt() -> str:
+    """
+    Prompt de chamada única: classifica E extrai os campos no mesmo turno.
+    Mais barato (1 chamada em vez de 2), mas mistura as duas tarefas -
+    se a classificação estiver errada, os campos extraídos seguem o
+    schema do tipo errado. Prefira `build_classification_prompt` +
+    `build_extraction_prompt` (2 chamadas) quando precisão importar mais
+    que custo.
+    """
+    catalogo_tipos = "\n".join(f'  - "{t.value}"' for t in CLASSIFICATION_RULES)
+    schemas = []
+    for doc_type, spec in AUDIT_SPECS.items():
+        campos = ", ".join(f'"{c}"' for c in spec.campos_obrigatorios)
+        schemas.append(f'  "{doc_type.value}": {{{campos}}}')
+    schemas_txt = "\n".join(schemas)
+
+    return f"""Você é um classificador e extrator de documentos de auditoria de
+repasses Fundo a Fundo (saúde). Olhe a imagem, identifique o tipo de
+documento entre:
+{catalogo_tipos}
+
+Depois, extraia os campos correspondentes ao tipo identificado, por
+FUNÇÃO SEMÂNTICA (não por posição fixa), seguindo o schema de campos de
+cada tipo:
+{schemas_txt}
+
+Regras de extração:
+  - Campos ausentes na imagem: null (não invente valores).
+  - Listas (ex.: unidades de saúde): lista de objetos com os subcampos
+    relevantes (ex.: nome + CNES).
+  - Datas em "YYYY-MM-DD"; valores monetários como número (float).
+
+Responda APENAS em JSON, sem markdown, no formato:
+{{"tipo": "<um dos tipos acima ou null>", "confianca": <0.0 a 1.0>,
+  "campos": {{...os campos do schema do tipo identificado...}}}}
+"""
+
+
+def build_extraction_prompt(doc_type: DocumentType) -> str:
+    spec = AUDIT_SPECS[doc_type]
+    campos = "\n".join(f'  - "{c}"' for c in spec.campos_obrigatorios)
+
+    return f"""Você está auditando um documento do tipo "{doc_type.value}".
+Extraia os campos abaixo por FUNÇÃO SEMÂNTICA (o que o campo representa),
+e não pela posição fixa no layout - a redação/diagramação varia entre
+municípios, bancos ou sistemas.
+
+Campos a extrair:
+{campos}
+
+Regras:
+  - Se um campo for uma LISTA (ex.: unidades de saúde), retorne uma lista de
+    objetos, cada um com os subcampos relevantes (ex.: nome + CNES).
+  - Se um campo não estiver presente na imagem, retorne null para ele -
+    NÃO invente valores.
+  - Datas no formato "YYYY-MM-DD". Valores monetários como número (float).
+
+Responda APENAS em JSON, sem markdown, sem texto adicional, com uma chave
+por campo listado acima.
+"""
+
+
+# ---------------------------------------------------------------------------
+# 3. CHAMADA AO MODELO COM VISÃO
+# ---------------------------------------------------------------------------
+
+@dataclass
+class VisionClassification:
+    document_type: Optional[DocumentType]
+    confidence: float
+    indicios_encontrados: list[str]
+
+
+class VisionDocumentReader:
+    """
+    Encapsula as chamadas ao modelo com visão. Usa a API da Anthropic
+    (Claude) por padrão; troque `_call_vision` para usar outro provedor
+    multimodal se preferir.
+    """
+
+    def __init__(self, api_key: Optional[str] = None, model: str = "claude-sonnet-4-6"):
+        if anthropic is None:
+            raise RuntimeError("Instale o SDK: pip install anthropic")
+        self.client = anthropic.Anthropic(api_key=api_key or os.environ.get("ANTHROPIC_API_KEY"))
+        self.model = model
+
+    def _call_vision(self, image_bytes: bytes, prompt: str) -> str:
+        response = self.client.messages.create(
+            model=self.model,
+            max_tokens=1500,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": _media_type_for(image_bytes),
+                            "data": _b64(image_bytes),
+                        },
+                    },
+                    {"type": "text", "text": prompt},
+                ],
+            }],
+        )
+        return "".join(block.text for block in response.content if block.type == "text")
+
+    @staticmethod
+    def _parse_json(raw: str) -> dict[str, Any]:
+        cleaned = raw.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+        return json.loads(cleaned)
+
+    def classify(self, image_bytes: bytes) -> VisionClassification:
+        raw = self._call_vision(image_bytes, build_classification_prompt())
+        data = self._parse_json(raw)
+        tipo_str = data.get("tipo")
+        doc_type = DocumentType(tipo_str) if tipo_str else None
+        return VisionClassification(
+            document_type=doc_type,
+            confidence=float(data.get("confianca", 0.0)),
+            indicios_encontrados=data.get("indicios_encontrados", []),
+        )
+
+    def extract_fields(self, image_bytes: bytes, doc_type: DocumentType) -> dict[str, Any]:
+        raw = self._call_vision(image_bytes, build_extraction_prompt(doc_type))
+        return self._parse_json(raw)
+
+    def classify_and_extract(self, image_bytes: bytes) -> tuple[VisionClassification, dict[str, Any]]:
+        """Chamada única: classifica e extrai os campos no mesmo turno."""
+        raw = self._call_vision(image_bytes, build_combined_prompt())
+        data = self._parse_json(raw)
+        tipo_str = data.get("tipo")
+        doc_type = DocumentType(tipo_str) if tipo_str else None
+        classification = VisionClassification(
+            document_type=doc_type,
+            confidence=float(data.get("confianca", 0.0)),
+            indicios_encontrados=[],
+        )
+        return classification, data.get("campos", {})
+
+
+# ---------------------------------------------------------------------------
+# 4. PIPELINE PONTA A PONTA - arquivos (PDF/imagem) -> tabela de auditoria
+# ---------------------------------------------------------------------------
+
+def run_vision_pipeline(
+    file_paths: list[str],
+    context: dict[str, Any],
+    reader: Optional[VisionDocumentReader] = None,
+    min_confidence: float = 0.5,
+    mode: str = "two_call",
+) -> list[tuple[str, str, str]]:
+    """
+    file_paths: lista de caminhos de PDF ou imagem (um documento por
+                arquivo; PDFs multi-página são tratados página a página,
+                cada página classificada individualmente).
+    context: mesmo dicionário usado em `gestorflow_auditoria.run_pipeline`
+             (cadastro da proposta, ficha do CNES, datas de referência etc.)
+    mode: "two_call" (padrão, mais preciso: classifica e só então extrai
+          com o schema certo) ou "single_call" (1 chamada só, mais barato,
+          mas classificação e extração saem do mesmo turno do modelo).
+    """
+    if mode not in ("two_call", "single_call"):
+        raise ValueError('mode deve ser "two_call" ou "single_call"')
+
+    reader = reader or VisionDocumentReader()
+    documents: dict[DocumentType, DocumentRecord] = {}
+    rows: list[tuple[str, str, str]] = []
+
+    for path in file_paths:
+        for page_num, image_bytes in enumerate(load_as_images(path), start=1):
+            label_base = os.path.basename(path) + (f" (pág. {page_num})" if path.lower().endswith(".pdf") else "")
+
+            if mode == "single_call":
+                classification, fields_ = reader.classify_and_extract(image_bytes)
+            else:
+                classification = reader.classify(image_bytes)
+                fields_ = {}
+
+            if classification.document_type is None or classification.confidence < min_confidence:
+                rows.append((label_base, "NAO CLASSIFICADO",
+                             f"confianca={classification.confidence:.2f}"))
+                continue
+
+            doc_type = classification.document_type
+            if mode == "two_call":
+                fields_ = reader.extract_fields(image_bytes, doc_type)
+            result = audit_document(doc_type, label_base, fields_, context)
+
+            documents[doc_type] = DocumentRecord(
+                document_type=doc_type,
+                label=result.document_label,
+                data_documento=_parse_date_field(fields_),
+                is_digital=True,
+                conformity=result,
+            )
+
+    validate_chain(documents)
+
+    if DocumentType.DECLARACAO_LIMITES in documents and context.get("data_referencia_auditoria"):
+        validate_declaracao_limites(
+            documents[DocumentType.DECLARACAO_LIMITES],
+            context["data_referencia_auditoria"],
+        )
+
+    for record in documents.values():
+        conforme = record.conformity.conforme if record.conformity else False
+        pendencias = list(record.conformity.pendencias) if record.conformity else []
+        if record.invalidado_em_cascata:
+            conforme = False
+            if record.motivo_invalidacao:
+                pendencias.append(record.motivo_invalidacao)
+        rows.append((record.label, "CONFORME" if conforme else "NAO CONFORME",
+                     "; ".join(pendencias) if pendencias else "-"))
+
+    return rows
+
+
+def _parse_date_field(fields_: dict[str, Any]):
+    """Tenta achar um campo de data plausível entre os extraídos, para uso
+    na validação da cadeia cronológica (best-effort)."""
+    from datetime import date
+    for key in ("data", "data_emissao", "data_documento", "data_solicitacao",
+                "data_assinatura", "data_publicacao"):
+        val = fields_.get(key)
+        if val:
+            try:
+                return date.fromisoformat(val)
+            except (ValueError, TypeError):
+                continue
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Exemplo de uso
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    arquivos = [
+        "/caminho/oficio_processo123.pdf",
+        "/caminho/rg_presidente_cms.jpg",
+    ]
+    contexto = {
+        "cadastro_proposta": {"municipio": "Exemplo/MA"},
+        "data_referencia_auditoria": "2026-09-21",
+    }
+    for linha in run_vision_pipeline(arquivos, contexto):
+        print(linha)

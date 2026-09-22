@@ -1,0 +1,6 @@
+# Núcleo (classificação/auditoria por texto) não tem dependências externas.
+
+# Extensão com visão computacional (gestorflow_vision.py):
+pymupdf>=1.24
+anthropic>=0.40
+pillow>=10.0
