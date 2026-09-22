@@ -20,8 +20,33 @@ de dependência/invalidação em cascata entre eles.
   auditoria como fonte única da verdade dos prompts.
 - **`test_gestorflow_auditoria.py`** — testes unitários das regras de
   conformidade e da cadeia cronológica.
+- **`gestorflow_cli.py`** — CLI de ponta a ponta: recebe arquivos
+  (PDF/imagem) + um JSON de contexto e roda `gestorflow_vision` sobre
+  eles, imprimindo/gravando a tabela final de conformidade.
 
-## Uso
+## Uso via CLI
+
+```bash
+export ANTHROPIC_API_KEY=sk-ant-...
+
+python gestorflow_cli.py \
+  --context examples/context_exemplo.json \
+  --files documentos/oficio.pdf documentos/rg_presidente.jpg \
+  --output resultado.md
+```
+
+O JSON de contexto segue o schema de `AuditContext`
+(ver [`examples/context_exemplo.json`](examples/context_exemplo.json)):
+cadastro da proposta, ficha do CNES, ato de nomeação do presidente do CMS,
+documento de identificação já auditado, resoluções já usadas, contrato de
+abertura de conta, certidão TCE, SIOPE bimestral e as datas de referência
+da auditoria.
+
+Use `--mode single_call` para uma chamada só por página (mais barato, mas
+mistura classificação e extração) em vez do padrão `two_call` (classifica
+e só então extrai com o schema certo).
+
+## Uso programático
 
 ```python
 from gestorflow_auditoria import AuditContext, run_pipeline
@@ -46,7 +71,7 @@ ambiente e as dependências opcionais em `requirements.txt`).
 ## Testes
 
 ```bash
-python -m unittest test_gestorflow_auditoria.py -v
+python -m unittest test_gestorflow_auditoria.py test_gestorflow_cli.py -v
 ```
 
 ## Instalação (extensão de visão)

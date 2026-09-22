@@ -1,0 +1,33 @@
+{
+  "cadastro_proposta": {
+    "municipio": "Exemplo/MA",
+    "prefeito": "Fulano de Tal",
+    "valor_recurso": 10000.0,
+    "resolucao_cms": "01/2026",
+    "numero_resolucao": "01/2026",
+    "valor_aprovado": 10000.0,
+    "presidente_cms": "Ciclana da Silva",
+    "unidades": [
+      {"cnes": "1111111", "nome": "UBS Centro"},
+      {"cnes": "2222222", "nome": "UBS Bairro Novo"}
+    ]
+  },
+  "ficha_cnes": {},
+  "ato_nomeacao_presidente": {
+    "nome": "Ciclana da Silva",
+    "data_expedicao": "2025-01-15",
+    "vigencia_anos": 2
+  },
+  "doc_identificacao_presidente": {
+    "nome": "Ciclana da Silva"
+  },
+  "resolucoes_ja_usadas": [],
+  "contrato_abertura_conta": {
+    "agencia": "1234",
+    "conta": "56789-0"
+  },
+  "certidao_tce": {},
+  "siope_bimestral": {},
+  "data_referencia_auditoria": "2026-09-21",
+  "ano_referencia_auditoria": 2026
+}
