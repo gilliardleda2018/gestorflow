@@ -10,3 +10,6 @@ google-genai>=1.0    # Gemini - tem tier gratuito (aistudio.google.com)
 
 # Verificação de assinatura digital em PDF - ICP-Brasil (gestorflow_signature.py):
 pyHanko>=0.25
+
+# Interface web (app.py):
+streamlit>=1.38
